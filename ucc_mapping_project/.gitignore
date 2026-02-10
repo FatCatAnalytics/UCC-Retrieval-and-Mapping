@@ -141,6 +141,10 @@ Outputs/
 *.txt
 *.log
 
+# Exception: Include only master mappings (exclude raw UCC data)
+!Inputs/
+!Inputs/master_mappings.csv
+
 # Machine Learning Models and Caches
 models/*/
 models/bge-small-en-v1.5/
