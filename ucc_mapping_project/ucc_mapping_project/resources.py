@@ -24,6 +24,10 @@ class PipelineConfig(ConfigurableResource):
         default=str(_PROJECT_ROOT / "Inputs" / "master_mappings.csv"),
         description="Path to master mapping file"
     )
+    universe_file: str = Field(
+        default=str(_PROJECT_ROOT / "Inputs" / "our universe.csv"),
+        description="Path to our-universe file (tab-delimited) containing SECP_NAME, GU_COMPANY_NAME, and Firm_ID"
+    )
     output_dir: str = Field(
         default=str(_PROJECT_ROOT / "Outputs"),
         description="Directory for output files"
