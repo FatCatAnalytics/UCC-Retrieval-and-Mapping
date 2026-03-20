@@ -1566,6 +1566,105 @@ def pipeline_outputs(
     full_path = output_dir / f"full_results_{timestamp}.csv"
     output_df.to_csv(full_path, index=False)
     context.log.info(f"Full results: {len(output_df):,} records -> {full_path}")
+
+    # ------------------------------------------------------------------
+    # Exact, Fuzzy, and Advanced master matches — slim export (deduped on
+    # SECP_NAME) and left-join onto the full raw UCC file. Unmatched rows
+    # are excluded.
+    # ------------------------------------------------------------------
+    def _master_match_mask(series: pd.Series) -> pd.Series:
+        s = series.astype("string")
+        return series.notna() & (
+            s.str.startswith("Exact Match", na=False)
+            | s.str.startswith("Fuzzy Match", na=False)
+            | s.str.startswith("Advanced Match", na=False)
+        )
+
+    enrich_cols = [
+        "SECP_NAME_MAPPED",
+        "match_method",
+        "match_score",
+        "confidence",
+        "Firm_ID",
+        "GU_COMPANY_NAME",
+    ]
+    ef_mask = _master_match_mask(df["match_method"])
+    ef_source = df.loc[ef_mask].copy()
+    if "GU_COMPANY_NAME_universe" in ef_source.columns:
+        ef_source["GU_COMPANY_NAME"] = ef_source["GU_COMPANY_NAME_universe"]
+    else:
+        ef_source["GU_COMPANY_NAME"] = pd.NA
+
+    n_before_dedup = len(ef_source)
+    ef_dedup = ef_source.drop_duplicates(subset=["SECP_NAME"], keep="first")
+    n_dup_dropped = n_before_dedup - len(ef_dedup)
+    if n_dup_dropped:
+        context.log.info(
+            f"Slim / raw-join lookup: dropped {n_dup_dropped:,} duplicate SECP_NAME "
+            f"rows (keep=first) before export and merge"
+        )
+
+    slim_cols = [
+        "SECP_NAME",
+        "SECP_NAME_MAPPED",
+        "match_method",
+        "match_score",
+        "confidence",
+        "Firm_ID",
+        "GU_COMPANY_NAME",
+    ]
+    slim_available = [c for c in slim_cols if c in ef_dedup.columns]
+    ef_slim = ef_dedup[slim_available].copy()
+    ef_slim_path = output_dir / f"exact_fuzzy_mapped_{timestamp}.csv"
+    ef_slim.to_csv(ef_slim_path, index=False)
+    context.log.info(
+        f"Master-matched slim (deduped SECP_NAME): {len(ef_slim):,} records -> {ef_slim_path}"
+    )
+
+    raw_enriched_path = None
+    raw_enriched_rows = 0
+    raw_with_any_enrichment = 0
+
+    if "SECP_NAME" not in ef_dedup.columns:
+        context.log.warning(
+            "Enriched dataframe missing SECP_NAME; skipping raw_ucc merge"
+        )
+    else:
+        map_for_join = ef_dedup[["SECP_NAME"] + enrich_cols].drop_duplicates(
+            subset=["SECP_NAME"],
+            keep="first",
+        )
+        try:
+            raw_full = pd.read_csv(
+                config.ucc_file,
+                sep=",",
+                encoding="latin-1",
+            )
+        except Exception as e:
+            context.log.error(f"Could not read full raw UCC for merge: {e}")
+        else:
+            if "SECP_NAME" not in raw_full.columns:
+                context.log.warning(
+                    "raw_ucc has no SECP_NAME column; skipping raw_ucc merge"
+                )
+            else:
+                raw_enriched = raw_full.merge(
+                    map_for_join,
+                    on="SECP_NAME",
+                    how="left",
+                )
+                raw_enriched_path = output_dir / f"raw_ucc_enriched_{timestamp}.csv"
+                raw_enriched.to_csv(raw_enriched_path, index=False)
+                raw_enriched_rows = len(raw_enriched)
+                raw_with_any_enrichment = int(
+                    raw_enriched["SECP_NAME_MAPPED"].notna().sum()
+                )
+                context.log.info(
+                    f"Raw UCC enriched (left join on SECP_NAME): "
+                    f"{raw_enriched_rows:,} rows, "
+                    f"{raw_with_any_enrichment:,} with master-match mapping columns "
+                    f"-> {raw_enriched_path}"
+                )
     
     # Summary
     summary_path = output_dir / f"summary_{timestamp}.txt"
@@ -1607,19 +1706,32 @@ def pipeline_outputs(
             with_gu = output_df['GU_COMPANY_NAME_universe'].notna().sum()
             f.write(f"  Records with GU_COMPANY_NAME: {with_gu:,}\n")
 
+        f.write("\nExact / Fuzzy / Advanced (excludes Unmatched); slim deduped on SECP_NAME:\n")
+        f.write(f"  Slim export rows: {len(ef_slim):,}\n")
+        if raw_enriched_path is not None:
+            f.write(
+                f"  Raw UCC enriched file rows: {raw_enriched_rows:,} "
+                f"({raw_with_any_enrichment:,} rows with mapping columns filled)\n"
+            )
+
     firm_matched = int(output_df['Firm_ID'].notna().sum()) if 'Firm_ID' in output_df.columns else 0
     auto_pct = len(auto_df) / len(df) * 100 if len(df) > 0 else 0
     
-    return MaterializeResult(
-        metadata={
-            "total_records": MetadataValue.int(len(df)),
-            "auto_mapped_count": MetadataValue.int(len(auto_df)),
-            "auto_mapped_pct": MetadataValue.float(auto_pct),
-            "review_needed_count": MetadataValue.int(len(review_df)),
-            "new_entities_count": MetadataValue.int(len(new_df)),
-            "firm_id_matched_count": MetadataValue.int(firm_matched),
-            "output_dir": MetadataValue.path(str(output_dir)),
-            "timestamp": MetadataValue.text(timestamp),
-        }
-    )
+    meta = {
+        "total_records": MetadataValue.int(len(df)),
+        "auto_mapped_count": MetadataValue.int(len(auto_df)),
+        "auto_mapped_pct": MetadataValue.float(auto_pct),
+        "review_needed_count": MetadataValue.int(len(review_df)),
+        "new_entities_count": MetadataValue.int(len(new_df)),
+        "firm_id_matched_count": MetadataValue.int(firm_matched),
+        "mapping_slim_deduped_count": MetadataValue.int(len(ef_slim)),
+        "output_dir": MetadataValue.path(str(output_dir)),
+        "timestamp": MetadataValue.text(timestamp),
+    }
+    if raw_enriched_path is not None:
+        meta["raw_ucc_enriched_rows"] = MetadataValue.int(raw_enriched_rows)
+        meta["raw_ucc_enriched_with_mapping"] = MetadataValue.int(
+            raw_with_any_enrichment
+        )
+    return MaterializeResult(metadata=meta)
 
