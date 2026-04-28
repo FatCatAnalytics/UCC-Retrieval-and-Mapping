@@ -48,8 +48,9 @@ def enrich(df: pd.DataFrame, secp_to_firm_ci) -> pd.DataFrame:
     """Add / overwrite Firm_ID from tracked banks."""
     df = df.copy()
 
-    # Drop stale columns so we start fresh
-    df = df.drop(columns=["Firm_ID", "GU_COMPANY_NAME_universe"], errors="ignore")
+    # Drop stale enrichment columns so we start fresh
+    stale_cols = ["Firm_ID"] + [col for col in df.columns if col.startswith("GU_")]
+    df = df.drop(columns=stale_cols, errors="ignore")
     df["Firm_ID"] = pd.NA
 
     # Pass 1 – SECP_NAME_MAPPED is authoritative

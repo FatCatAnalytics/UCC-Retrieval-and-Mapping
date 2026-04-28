@@ -1599,7 +1599,6 @@ def universe_enriched_results(
     )
     if universe.empty:
         df["Firm_ID"] = existing_firm_id
-        df["GU_COMPANY_NAME_universe"] = pd.NA
         context.log.info(
             f"Tracked-bank enrichment skipped: {int(df['Firm_ID'].notna().sum()):,} "
             "rows keep Firm_ID from master mapping"
@@ -1634,7 +1633,6 @@ def universe_enriched_results(
     # Initialise output columns
     # ------------------------------------------------------------------
     df["Firm_ID"] = existing_firm_id
-    df["GU_COMPANY_NAME_universe"] = pd.NA
 
     # ------------------------------------------------------------------
     # Pass 1 – SECP_NAME_MAPPED is the authoritative resolved identity.
@@ -1719,7 +1717,7 @@ def pipeline_outputs(
     ]
     cluster_cols = ['cluster_id', 'cluster_label', 'cluster_size']
     suggestion_cols = ['suggested_mapping', 'suggestion_score', 'suggestion_confidence', 'alternative_suggestions']
-    universe_cols = ['Firm_ID', 'GU_COMPANY_NAME_universe']
+    universe_cols = ['Firm_ID']
     
     all_cols = base_cols + match_cols + cluster_cols + suggestion_cols + universe_cols
     available_cols = [c for c in all_cols if c in df.columns]
@@ -1775,14 +1773,9 @@ def pipeline_outputs(
         "match_score",
         "confidence",
         "Firm_ID",
-        "GU_COMPANY_NAME",
     ]
     ef_mask = _master_match_mask(df["match_method"])
     ef_source = df.loc[ef_mask].copy()
-    if "GU_COMPANY_NAME_universe" in ef_source.columns:
-        ef_source["GU_COMPANY_NAME"] = ef_source["GU_COMPANY_NAME_universe"]
-    else:
-        ef_source["GU_COMPANY_NAME"] = pd.NA
 
     n_before_dedup = len(ef_source)
     join_key_cols = [col for col in RAW_MATCH_COLUMNS if col in ef_source.columns]
@@ -1803,7 +1796,6 @@ def pipeline_outputs(
         "match_score",
         "confidence",
         "Firm_ID",
-        "GU_COMPANY_NAME",
     ]
     slim_available = [c for c in slim_cols if c in ef_dedup.columns]
     ef_slim = ef_dedup[slim_available].copy()
