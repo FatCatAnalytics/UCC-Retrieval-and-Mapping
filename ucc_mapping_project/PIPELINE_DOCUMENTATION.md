@@ -92,8 +92,9 @@ ucc_mapping_project/
 │   ├── data_structures.py     # NGramIndex, TFIDFNGramIndex, UnionFind
 │   └── bge-small-en-v1.5/    # Local SentenceTransformer model
 ├── Inputs/
-│   ├── raw_ucc.csv            # 99,719 rows (SECP_NAME, SECP_STATE)
-│   └── master_mappings.csv    # 9,712 rows (SECP_NAME → SECP_NAME_MAPPED)
+│   ├── raw.csv                # Raw UCC filing records
+│   ├── master_list.csv        # Known good mappings with state-aware keys
+│   └── tracked_banks.csv      # Tracked bank names and Firm IDs
 ├── Outputs/                   # Generated CSV files per confidence level
 ├── tests/
 │   └── test_normalize.py      # 67 unit tests
@@ -104,8 +105,9 @@ ucc_mapping_project/
 
 | File | Columns | Rows | Description |
 |------|---------|------|-------------|
-| `raw_ucc.csv` | `SECP_NAME`, `SECP_STATE` | ~99,719 | Raw UCC filing records — each row is a secured party from a UCC filing |
-| `master_mappings.csv` | `SECP_NAME`, `SECP_NAME_MAPPED` | ~9,712 | Known good mappings — `SECP_NAME` is the raw name, `SECP_NAME_MAPPED` is the canonical entity |
+| `raw.csv` | `DEBT_STATE`, `SECP_STATE`, `SECP_NAME` | varies | Raw UCC filing records — each row is a secured party from a UCC filing |
+| `master_list.csv` | `DEBT_STATE`, `SECP_STATE`, `SECP_NAME`, `SECP_NAME_MAPPED`, `Firm ID` | varies | Known good mappings with state-aware match keys |
+| `tracked_banks.csv` | `Bank Name`, `Firm ID` | varies | Tracked bank names used to enrich results with Firm IDs |
 
 ---
 
@@ -117,8 +119,9 @@ The `PipelineConfig` class extends Dagster's `ConfigurableResource` and centrali
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `ucc_path` | `Inputs/raw_ucc.csv` | Path to UCC filings (resolved from project root) |
-| `master_path` | `Inputs/master_mappings.csv` | Path to master mapping table |
+| `ucc_file` | `Inputs/raw.csv` | Path to UCC filings (resolved from project root) |
+| `master_file` | `Inputs/master_list.csv` | Path to master mapping table |
+| `universe_file` | `Inputs/tracked_banks.csv` | Path to tracked bank Firm ID table |
 | `output_dir` | `Outputs` | Directory for all output files |
 | `embedding_model` | `models/bge-small-en-v1.5` | Local path to the SentenceTransformer model |
 
@@ -624,8 +627,8 @@ Checks whether two entity types are compatible for matching.
 #### `ucc_raw_data`
 
 **Type:** Dagster asset (ingestion)  
-**Input:** `raw_ucc.csv`  
-**Output:** `pd.DataFrame` with columns `[SECP_NAME, SECP_STATE]`
+**Input:** `raw.csv`  
+**Output:** `pd.DataFrame` with columns `[DEBT_STATE, SECP_STATE, SECP_NAME]`
 
 - Reads the CSV file from the configured path
 - Drops duplicate rows
@@ -634,8 +637,8 @@ Checks whether two entity types are compatible for matching.
 #### `master_mapping_data`
 
 **Type:** Dagster asset (ingestion)  
-**Input:** `master_mappings.csv`  
-**Output:** `pd.DataFrame` with columns `[SECP_NAME, SECP_NAME_MAPPED]`
+**Input:** `master_list.csv`  
+**Output:** `pd.DataFrame` with columns `[DEBT_STATE, SECP_STATE, SECP_NAME, SECP_NAME_MAPPED, Firm ID]`
 
 - Reads the master mapping CSV
 - Logs the record count

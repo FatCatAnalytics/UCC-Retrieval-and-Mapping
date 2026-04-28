@@ -1518,7 +1518,7 @@ def suggested_mapping_results(
 
 
 @asset(
-    description="Load our-universe file mapping SECP_NAME to Firm_ID and GU_COMPANY_NAME",
+    description="Load tracked banks file mapping bank names to Firm_ID",
     compute_kind="pandas",
     group_name="ingestion",
     tags={"domain": "ucc-mapping", "stage": "ingestion"},
@@ -1527,45 +1527,38 @@ def our_universe_data(
     context: AssetExecutionContext,
     config: PipelineConfig,
 ) -> Output[pd.DataFrame]:
-    """Load the our-universe file.
-
-    The file is tab-delimited with columns:
-        SECP_NAME, SECP_STATE, SECP_CITY, GU_COMPANY_NAME, Firm_ID
-
-    We keep all rows so that SECP_NAME can be used as an additional lookup
-    key when joining to mapped results later.
-    """
+    """Load tracked banks and normalize them to the pipeline lookup schema."""
     if not Path(config.universe_file).exists():
         context.log.warning(
-            f"Our-universe file not found at {config.universe_file}; "
+            f"Tracked banks file not found at {config.universe_file}; "
             "continuing with Firm_ID values from the master mapping file only"
         )
-        df = pd.DataFrame(columns=["SECP_NAME", "GU_COMPANY_NAME", "Firm_ID"])
+        df = pd.DataFrame(columns=["SECP_NAME", "Firm_ID"])
         return Output(
             value=df,
             metadata={
                 "row_count": MetadataValue.int(0),
                 "unique_firm_ids": MetadataValue.int(0),
-                "preview": MetadataValue.md("No universe file found."),
+                "preview": MetadataValue.md("No tracked banks file found."),
                 "source_file": MetadataValue.text(config.universe_file),
             },
         )
 
     df = pd.read_csv(
         config.universe_file,
-        sep="\t",
+        sep=_detect_delimiter(config.universe_file),
         encoding="latin-1",
-        usecols=["SECP_NAME", "GU_COMPANY_NAME", "Firm_ID"],
-        dtype={"Firm_ID": "Int64"},
+        usecols=["Bank Name", "Firm ID"],
+        dtype={"Firm ID": "Int64"},
     ).drop_duplicates()
+    df = df.rename(columns={"Bank Name": "SECP_NAME", "Firm ID": "Firm_ID"})
 
     df = df[df["SECP_NAME"].notna() & (df["SECP_NAME"].str.strip() != "")]
     df = df.reset_index(drop=True)
 
     context.log.info(
-        f"Loaded {len(df):,} our-universe rows | "
-        f"{df['Firm_ID'].notna().sum():,} with Firm_ID | "
-        f"{df['GU_COMPANY_NAME'].notna().sum():,} with GU_COMPANY_NAME"
+        f"Loaded {len(df):,} tracked bank rows | "
+        f"{df['Firm_ID'].notna().sum():,} with Firm_ID"
     )
 
     return Output(
@@ -1580,7 +1573,7 @@ def our_universe_data(
 
 
 @asset(
-    description="Enrich pipeline results with Firm_ID and GU_COMPANY_NAME from our universe",
+    description="Enrich pipeline results with Firm_ID from tracked banks",
     compute_kind="pandas",
     group_name="reporting",
     tags={"domain": "ucc-mapping", "stage": "reporting"},
@@ -1590,19 +1583,12 @@ def universe_enriched_results(
     suggested_mapping_results: pd.DataFrame,
     our_universe_data: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Join our-universe Firm_ID / GU_COMPANY_NAME onto the matched results.
+    """Join tracked-bank Firm_ID values onto the matched results.
 
     Matching logic (applied in priority order):
-      1. Exact match on SECP_NAME_MAPPED  →  GU_COMPANY_NAME (where GU_COMPANY_NAME
-         is populated in the universe file).
-      2. Exact match on SECP_NAME_MAPPED  →  Firm_ID (direct lookup keyed on the
-         mapped name).
-      3. Exact match on SECP_NAME  →  Firm_ID / GU_COMPANY_NAME (for rows where the
-         raw filing name is present in the universe, even when SECP_NAME_MAPPED
-         differs or is absent).
-
-    Universe rows where both GU_COMPANY_NAME and Firm_ID are null are still
-    retained in the lookup so that Firm_ID-only rows contribute to the join.
+      1. Exact match on SECP_NAME_MAPPED → tracked Bank Name → Firm_ID.
+      2. Exact match on raw SECP_NAME → tracked Bank Name → Firm_ID, only where
+         the mapped-name lookup did not produce a Firm_ID.
     """
     df = suggested_mapping_results.copy()
     universe = our_universe_data.copy()
@@ -1615,30 +1601,26 @@ def universe_enriched_results(
         df["Firm_ID"] = existing_firm_id
         df["GU_COMPANY_NAME_universe"] = pd.NA
         context.log.info(
-            f"Universe enrichment skipped: {int(df['Firm_ID'].notna().sum()):,} "
+            f"Tracked-bank enrichment skipped: {int(df['Firm_ID'].notna().sum()):,} "
             "rows keep Firm_ID from master mapping"
         )
         return df
 
     # ------------------------------------------------------------------
-    # Build case-insensitive lookup tables from the universe file.
+    # Build case-insensitive lookup tables from the tracked banks file.
     # All keys are stored upper-cased so lookups are case-insensitive.
-    # When multiple universe rows map to the same upper-cased key we keep
+    # When multiple tracked-bank rows map to the same upper-cased key we keep
     # the one whose Firm_ID appears most frequently (majority vote), which
     # prevents a rare mis-keyed row from overriding the correct Firm_ID.
     # ------------------------------------------------------------------
 
     def _majority_firm(sub: pd.DataFrame) -> pd.Series:
-        """Return the most common Firm_ID (and its GU_COMPANY_NAME) for a group."""
+        """Return the most common Firm_ID for a tracked bank name."""
         if sub["Firm_ID"].notna().any():
             firm = sub["Firm_ID"].dropna().mode().iloc[0]
-            gu_rows = sub.loc[sub["Firm_ID"] == firm, "GU_COMPANY_NAME"]
-            gu = gu_rows.dropna().iloc[0] if gu_rows.notna().any() else pd.NA
         else:
             firm = pd.NA
-            gu_rows = sub["GU_COMPANY_NAME"].dropna()
-            gu = gu_rows.iloc[0] if not gu_rows.empty else pd.NA
-        return pd.Series({"Firm_ID": firm, "GU_COMPANY_NAME": gu})
+        return pd.Series({"Firm_ID": firm})
 
     universe["_key"] = universe["SECP_NAME"].str.upper().str.strip()
     univ_by_secp = (
@@ -1647,15 +1629,6 @@ def universe_enriched_results(
         .apply(_majority_firm, include_groups=False)
     )
     secp_to_firm_ci = univ_by_secp.set_index("_key")["Firm_ID"]
-    secp_to_gu_ci   = univ_by_secp.set_index("_key")["GU_COMPANY_NAME"]
-
-    # GU_COMPANY_NAME → Firm_ID (for resolving via SECP_NAME_MAPPED)
-    univ_gu = universe[universe["GU_COMPANY_NAME"].notna() & universe["Firm_ID"].notna()].copy()
-    univ_gu["_gu_key"] = univ_gu["GU_COMPANY_NAME"].str.upper().str.strip()
-    gu_to_firm_ci = (
-        univ_gu.groupby("_gu_key")["Firm_ID"]
-        .agg(lambda x: x.mode().iloc[0])
-    )
 
     # ------------------------------------------------------------------
     # Initialise output columns
@@ -1668,34 +1641,20 @@ def universe_enriched_results(
     # Always resolve Firm_ID from the mapped name first so that, e.g.,
     # "FIRST SECURITY BANK" mapped to "Glacier Bank" gets Firm_ID 5959
     # (Glacier Bancorp) rather than 1354 (First Security Bancorp).
-    #
-    # Sub-priority within Pass 1:
-    #   1a. SECP_NAME_MAPPED → universe SECP_NAME → Firm_ID / GU_COMPANY_NAME
-    #   1b. SECP_NAME_MAPPED → universe GU_COMPANY_NAME → Firm_ID
     # ------------------------------------------------------------------
     if "SECP_NAME_MAPPED" in df.columns:
         mapped_upper = df["SECP_NAME_MAPPED"].str.upper().str.strip()
 
-        # 1a: mapped name as a raw universe SECP_NAME
         mapped_firm_secp = mapped_upper.map(secp_to_firm_ci)
-        mapped_gu_secp   = mapped_upper.map(secp_to_gu_ci)
 
         has_mapped_firm = mapped_firm_secp.notna()
-        has_mapped_gu   = mapped_gu_secp.notna()
 
-        df.loc[has_mapped_firm, "Firm_ID"]                 = mapped_firm_secp[has_mapped_firm]
-        df.loc[has_mapped_gu,   "GU_COMPANY_NAME_universe"] = mapped_gu_secp[has_mapped_gu]
+        df.loc[has_mapped_firm, "Firm_ID"] = mapped_firm_secp[has_mapped_firm]
 
-        # 1b: mapped name as a GU_COMPANY_NAME
-        mapped_firm_gu = mapped_upper.map(gu_to_firm_ci)
-        fill_gu_firm = df["Firm_ID"].isna() & mapped_firm_gu.notna()
-        df.loc[fill_gu_firm, "Firm_ID"] = mapped_firm_gu[fill_gu_firm]
-
-        pass1_firm = int(has_mapped_firm.sum()) + int(fill_gu_firm.sum())
-        pass1_gu   = int(has_mapped_gu.sum())
+        pass1_firm = int(has_mapped_firm.sum())
         context.log.info(
-            f"Universe join – Pass 1 (SECP_NAME_MAPPED, case-insensitive): "
-            f"{pass1_firm:,} Firm_IDs, {pass1_gu:,} GU names matched"
+            f"Tracked-bank join - Pass 1 (SECP_NAME_MAPPED, case-insensitive): "
+            f"{pass1_firm:,} Firm_IDs matched"
         )
 
     # ------------------------------------------------------------------
@@ -1705,33 +1664,26 @@ def universe_enriched_results(
     secp_upper = df["SECP_NAME"].str.upper().str.strip()
 
     raw_firm = secp_upper.map(secp_to_firm_ci)
-    raw_gu   = secp_upper.map(secp_to_gu_ci)
 
     fill_raw_firm = df["Firm_ID"].isna() & raw_firm.notna()
-    fill_raw_gu   = df["GU_COMPANY_NAME_universe"].isna() & raw_gu.notna()
 
-    df.loc[fill_raw_firm, "Firm_ID"]                 = raw_firm[fill_raw_firm]
-    df.loc[fill_raw_gu,   "GU_COMPANY_NAME_universe"] = raw_gu[fill_raw_gu]
+    df.loc[fill_raw_firm, "Firm_ID"] = raw_firm[fill_raw_firm]
 
     pass2_firm = int(fill_raw_firm.sum())
-    pass2_gu   = int(fill_raw_gu.sum())
     context.log.info(
-        f"Universe join – Pass 2 (raw SECP_NAME fallback, case-insensitive): "
-        f"{pass2_firm:,} additional Firm_IDs, {pass2_gu:,} additional GU names"
+        f"Tracked-bank join - Pass 2 (raw SECP_NAME fallback, case-insensitive): "
+        f"{pass2_firm:,} additional Firm_IDs"
     )
 
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
     total_with_firm = int(df["Firm_ID"].notna().sum())
-    total_with_gu   = int(df["GU_COMPANY_NAME_universe"].notna().sum())
     total = len(df)
     context.log.info(
-        f"Universe enrichment complete: "
+        f"Tracked-bank enrichment complete: "
         f"{total_with_firm:,}/{total:,} rows have Firm_ID "
-        f"({total_with_firm / total * 100:.1f}%), "
-        f"{total_with_gu:,}/{total:,} have GU_COMPANY_NAME "
-        f"({total_with_gu / total * 100:.1f}%)"
+        f"({total_with_firm / total * 100:.1f}%)"
     )
 
     return df
@@ -1941,11 +1893,8 @@ def pipeline_outputs(
         # Universe coverage
         if 'Firm_ID' in output_df.columns:
             with_firm = output_df['Firm_ID'].notna().sum()
-            f.write(f"\nOur Universe Coverage:\n")
+            f.write(f"\nTracked Bank Coverage:\n")
             f.write(f"  Records with Firm_ID:         {with_firm:,}\n")
-        if 'GU_COMPANY_NAME_universe' in output_df.columns:
-            with_gu = output_df['GU_COMPANY_NAME_universe'].notna().sum()
-            f.write(f"  Records with GU_COMPANY_NAME: {with_gu:,}\n")
 
         f.write("\nExact / Fuzzy / Advanced (excludes Unmatched); slim deduped on state/name:\n")
         f.write(f"  Slim export rows: {len(ef_slim):,}\n")
