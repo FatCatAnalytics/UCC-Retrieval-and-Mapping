@@ -1876,6 +1876,533 @@ def universe_enriched_results(
     return df
 
 
+# =============================================================================
+# Stage 8: Lead-bank designation
+# =============================================================================
+
+# Candidate column names searched, in priority order, when the user has not
+# pinned an explicit override on PipelineConfig. Matched case-insensitively.
+_FILING_TYPE_COLUMN_CANDIDATES: tuple = (
+    "FILING_TYPE", "FILING_TYP", "FILE_TYPE", "FILETYPE",
+    "RECORD_TYPE", "REC_TYPE", "TYPE", "FILING",
+    "FILING_NATURE", "FILE_NATURE", "NATURE_OF_FILING",
+)
+_DEBTOR_COLUMN_CANDIDATES: tuple = (
+    "DEBT_NAME", "DEBTOR_NAME", "DEBT_FIRM", "DEBTOR_FIRM",
+    "DEBTOR", "DEBTOR_COMPANY", "COMPANY_NAME", "COMPANY",
+    "DEBT_COMPANY", "DEBTORS_NAME",
+)
+
+# Substring signals (matched on uppercased, stripped value) used to classify a
+# filing row as ORIGINAL or CONTINUATION. Order matters: continuation is
+# checked first so an "INITIAL CONTINUATION" (rare) classifies as continuation.
+_CONTINUATION_SIGNALS: tuple = ("CONTINU", "CONT.", " CONT", "CT ", "-CT", "_CT")
+_ORIGINAL_SIGNALS: tuple = (
+    "ORIGINAL", "INITIAL", "NEW", "FINANC",  # FINANCING / FINANCING STATEMENT
+    "UCC1", "UCC-1", "UCC 1",
+)
+
+
+def _classify_filing_type(value) -> str:
+    """Map a raw filing-type cell value to 'ORIGINAL', 'CONTINUATION', or 'OTHER'.
+
+    Falsy / NaN values map to 'OTHER'. Matching is case-insensitive and
+    substring-based to tolerate variants like 'Continuation Statement',
+    'CT', 'UCC1 - Original', etc. Continuation is checked first so a value
+    that contains both signals (rare) is classified as a continuation.
+    """
+    if value is None:
+        return "OTHER"
+    try:
+        if pd.isna(value):
+            return "OTHER"
+    except (TypeError, ValueError):
+        pass
+    s = str(value).strip().upper()
+    if not s:
+        return "OTHER"
+    for sig in _CONTINUATION_SIGNALS:
+        if sig in s:
+            return "CONTINUATION"
+    for sig in _ORIGINAL_SIGNALS:
+        if sig in s:
+            return "ORIGINAL"
+    return "OTHER"
+
+
+def _resolve_column(
+    available: List[str],
+    override: str,
+    candidates: tuple,
+) -> str:
+    """Resolve a column name from an explicit override or a candidate list.
+
+    Matching is case-insensitive. Returns the actual column name as it appears
+    in `available`, or an empty string if no candidate is present.
+    """
+    upper_to_actual = {c.upper(): c for c in available}
+    if override:
+        actual = upper_to_actual.get(override.strip().upper())
+        if actual:
+            return actual
+    for cand in candidates:
+        actual = upper_to_actual.get(cand.upper())
+        if actual:
+            return actual
+    return ""
+
+
+@asset(
+    description=(
+        "Stage 8: Count originals + continuations per (company, bank) and "
+        "designate a lead bank when one bank has >= the configured share "
+        "(default 66%) of filings. Single-bank companies are designated lead "
+        "only when they have multiple filings."
+    ),
+    compute_kind="pandas",
+    group_name="reporting",
+    tags={"domain": "ucc-mapping", "stage": "reporting"},
+)
+def lead_bank_designation(
+    context: AssetExecutionContext,
+    config: PipelineConfig,
+    universe_enriched_results: pd.DataFrame,
+) -> Output[pd.DataFrame]:
+    """Per-company / per-bank filing counts plus lead-bank designation.
+
+    Logic
+    -----
+    For each company (grouped by the debtor name found in the raw CSV plus
+    DEBT_STATE), we:
+
+      1. Count ORIGINAL filings and CONTINUATION filings per bank
+         (bank = ``SECP_NAME_MAPPED``, falling back to ``SECP_NAME`` when
+         unmapped).
+      2. Compute total filings (originals + continuations + other) per bank.
+      3. Compute share = bank_total / company_total.
+      4. Designate ``is_lead_bank = True`` when:
+           * the company has exactly one bank AND that bank has >= 2 filings
+             (sole bank with sustained relationship), OR
+           * the company has multiple banks AND this bank has the strictly
+             highest total AND ``share >= threshold`` (default 0.66).
+         A company with a single bank and a single filing is NOT designated
+         (insufficient evidence, per design discussion).
+
+    Outputs two CSVs to ``config.output_dir``:
+      * ``bank_filing_counts_{ts}.csv`` -- one row per (company, bank).
+      * ``lead_bank_by_company_{ts}.csv`` -- one row per company with the
+        designated lead bank, if any.
+
+    The returned DataFrame is the per-(company, bank) table.
+    """
+    enriched = universe_enriched_results.copy()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # 1. Re-read the full raw CSV (all columns) so we can access filing
+    #    type + debtor name fields that the matching pipeline drops.
+    # ------------------------------------------------------------------
+    try:
+        raw_full = pd.read_csv(
+            config.ucc_file,
+            sep=_detect_delimiter(config.ucc_file),
+            encoding="latin-1",
+        )
+    except Exception as e:
+        context.log.error(f"lead_bank_designation: could not read raw UCC file: {e}")
+        empty = pd.DataFrame(
+            columns=[
+                "Firm_ID", "company_name", "company_state",
+                "bank_name", "bank_firm_id",
+                "originals", "continuations", "other_filings", "total_filings",
+                "company_total_filings", "company_bank_count",
+                "share_of_company", "is_lead_bank", "lead_bank_reason",
+            ]
+        )
+        return Output(
+            value=empty,
+            metadata={
+                "row_count": MetadataValue.int(0),
+                "notes": MetadataValue.text("Raw CSV unreadable; lead-bank step skipped."),
+            },
+        )
+
+    raw_full = _standardize_state_columns(raw_full)
+
+    # ------------------------------------------------------------------
+    # 2. Resolve filing-type and debtor-name columns (with config overrides).
+    # ------------------------------------------------------------------
+    filing_type_col = _resolve_column(
+        list(raw_full.columns),
+        getattr(config, "filing_type_column", ""),
+        _FILING_TYPE_COLUMN_CANDIDATES,
+    )
+    debtor_col = _resolve_column(
+        list(raw_full.columns),
+        getattr(config, "debtor_company_column", ""),
+        _DEBTOR_COLUMN_CANDIDATES,
+    )
+
+    if not filing_type_col:
+        context.log.warning(
+            "lead_bank_designation: no filing-type column found in raw CSV. "
+            f"Looked for: {list(_FILING_TYPE_COLUMN_CANDIDATES)}. "
+            "All filings will be classified as 'OTHER' and counted toward total only. "
+            "Set PipelineConfig.filing_type_column to override."
+        )
+    else:
+        context.log.info(f"lead_bank_designation: filing-type column = '{filing_type_col}'")
+
+    if debtor_col:
+        context.log.info(f"lead_bank_designation: debtor-name column = '{debtor_col}'")
+    else:
+        context.log.info(
+            "lead_bank_designation: no debtor-name column in raw CSV; "
+            "will group companies by DEBT_STATE only (no company-level granularity)."
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Bring the resolved mapping (SECP_NAME_MAPPED, Firm_ID) from the
+    #    enriched pipeline output onto the full raw filings via the same
+    #    state/name key used elsewhere in the pipeline.
+    # ------------------------------------------------------------------
+    keep_from_enriched = [
+        c for c in [
+            "DEBT_STATE", "SECP_STATE", "SECP_NAME",
+            "SECP_NAME_MAPPED", "Firm_ID", "match_method", "confidence",
+        ] if c in enriched.columns
+    ]
+    join_keys_present = [c for c in RAW_MATCH_COLUMNS if c in enriched.columns and c in raw_full.columns]
+    if len(join_keys_present) == len(RAW_MATCH_COLUMNS):
+        map_df = enriched[keep_from_enriched].drop_duplicates(subset=RAW_MATCH_COLUMNS, keep="first")
+        joined = raw_full.merge(map_df, on=RAW_MATCH_COLUMNS, how="left")
+    else:
+        context.log.warning(
+            "lead_bank_designation: raw CSV / enriched results are missing one "
+            f"of the join key columns {RAW_MATCH_COLUMNS}; bank mapping may be incomplete."
+        )
+        joined = raw_full.copy()
+        for c in keep_from_enriched:
+            if c not in joined.columns:
+                joined[c] = pd.NA
+
+    # ------------------------------------------------------------------
+    # 4. Build the per-row classification + bank label + company key.
+    # ------------------------------------------------------------------
+    if filing_type_col:
+        joined["_filing_class"] = joined[filing_type_col].map(_classify_filing_type)
+    else:
+        joined["_filing_class"] = "OTHER"
+
+    # Bank label: prefer the resolved mapped name (cleaner / canonical),
+    # fall back to the raw secured-party name when unmapped.
+    if "SECP_NAME_MAPPED" in joined.columns:
+        bank_series = joined["SECP_NAME_MAPPED"].astype("string")
+    else:
+        bank_series = pd.Series([pd.NA] * len(joined), index=joined.index, dtype="string")
+    fallback_bank = (
+        joined["SECP_NAME"].astype("string")
+        if "SECP_NAME" in joined.columns
+        else pd.Series([pd.NA] * len(joined), index=joined.index, dtype="string")
+    )
+    has_mapped = bank_series.notna() & (bank_series.str.strip() != "")
+    joined["_bank_name"] = bank_series.where(has_mapped, fallback_bank)
+
+    # bank_firm_id: the secured-party Firm_ID resolved by the pipeline.
+    if "Firm_ID" not in joined.columns:
+        joined["Firm_ID"] = pd.NA
+    joined["_bank_firm_id"] = joined["Firm_ID"]
+
+    # Company key: prefer debtor name from raw (stripped, upper-cased) so
+    # that 'ACME, INC.' and 'acme inc' share a key. Append DEBT_STATE to
+    # disambiguate same-named companies in different states.
+    if debtor_col:
+        debtor_name_clean = joined[debtor_col].astype("string").str.strip()
+        debtor_key = debtor_name_clean.str.upper().fillna("")
+    else:
+        debtor_name_clean = pd.Series([pd.NA] * len(joined), index=joined.index, dtype="string")
+        debtor_key = pd.Series([""] * len(joined), index=joined.index, dtype="string")
+
+    state_key = (
+        joined["DEBT_STATE"].astype("string").fillna("")
+        if "DEBT_STATE" in joined.columns
+        else pd.Series([""] * len(joined), index=joined.index, dtype="string")
+    )
+    joined["_company_key"] = debtor_key + "||" + state_key
+    joined["_company_display"] = debtor_name_clean
+
+    # Drop rows where we have no usable bank label at all.
+    usable = joined["_bank_name"].notna() & (joined["_bank_name"].astype("string").str.strip() != "")
+    if not usable.any():
+        context.log.warning("lead_bank_designation: no rows have a bank label; producing empty output.")
+        empty = pd.DataFrame(
+            columns=[
+                "Firm_ID", "company_name", "company_state",
+                "bank_name", "bank_firm_id",
+                "originals", "continuations", "other_filings", "total_filings",
+                "company_total_filings", "company_bank_count",
+                "share_of_company", "is_lead_bank", "lead_bank_reason",
+            ]
+        )
+        return Output(value=empty, metadata={"row_count": MetadataValue.int(0)})
+
+    work = joined.loc[usable].copy()
+
+    # Drop rows where we don't have a real company identifier (empty key '||XX')
+    # because aggregating across all anonymous debtors would be misleading.
+    if not debtor_col:
+        context.log.warning(
+            "lead_bank_designation: aggregating by DEBT_STATE only because no "
+            "debtor-name column is available; the resulting 'companies' are "
+            "really per-state buckets. Configure debtor_company_column for "
+            "true company-level granularity."
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Aggregate per (company, bank).
+    # ------------------------------------------------------------------
+    bank_key_cols = ["_company_key", "_bank_name"]
+    pivot = (
+        work
+        .groupby(bank_key_cols + ["_filing_class"], dropna=False)
+        .size()
+        .unstack("_filing_class", fill_value=0)
+        .reset_index()
+    )
+    for col in ("ORIGINAL", "CONTINUATION", "OTHER"):
+        if col not in pivot.columns:
+            pivot[col] = 0
+    pivot["total_filings"] = pivot[["ORIGINAL", "CONTINUATION", "OTHER"]].sum(axis=1)
+
+    # Carry through display / id columns.
+    def _first_non_null(s: pd.Series):
+        nn = s.dropna()
+        return nn.iloc[0] if len(nn) else pd.NA
+
+    def _mode_or_first(s: pd.Series):
+        nn = s.dropna()
+        if not len(nn):
+            return pd.NA
+        m = nn.mode()
+        return m.iloc[0] if len(m) else nn.iloc[0]
+
+    agg_spec = {
+        "company_name": ("_company_display", _first_non_null),
+        "bank_firm_id": ("_bank_firm_id", _mode_or_first),
+    }
+    if "DEBT_STATE" in work.columns:
+        agg_spec["company_state"] = ("DEBT_STATE", _first_non_null)
+
+    meta_agg = work.groupby(bank_key_cols, dropna=False).agg(**agg_spec).reset_index()
+    counts = pivot.merge(meta_agg, on=bank_key_cols, how="left")
+
+    # Company-level totals + bank counts for the share computation.
+    company_totals = (
+        counts.groupby("_company_key", dropna=False)
+        .agg(
+            company_total_filings=("total_filings", "sum"),
+            company_bank_count=("_bank_name", "nunique"),
+        )
+        .reset_index()
+    )
+    counts = counts.merge(company_totals, on="_company_key", how="left")
+    counts["share_of_company"] = np.where(
+        counts["company_total_filings"] > 0,
+        counts["total_filings"] / counts["company_total_filings"],
+        0.0,
+    )
+
+    # ------------------------------------------------------------------
+    # 6. Apply lead-bank rule.
+    # ------------------------------------------------------------------
+    threshold = float(getattr(config, "lead_bank_threshold", 0.66))
+    counts["is_lead_bank"] = False
+    counts["lead_bank_reason"] = ""
+
+    # Single-bank / single-filing case -> never lead.
+    single_bank_single_filing = (
+        (counts["company_bank_count"] == 1) & (counts["company_total_filings"] <= 1)
+    )
+    counts.loc[single_bank_single_filing, "lead_bank_reason"] = (
+        "Insufficient evidence: 1 bank, 1 filing"
+    )
+
+    # Single-bank / multi-filing case -> lead (sustained sole relationship).
+    sole_bank_multi_filing = (
+        (counts["company_bank_count"] == 1) & (counts["company_total_filings"] >= 2)
+    )
+    counts.loc[sole_bank_multi_filing, "is_lead_bank"] = True
+    counts.loc[sole_bank_multi_filing, "lead_bank_reason"] = (
+        "Sole bank with >= 2 filings"
+    )
+
+    # Multi-bank case -> lead only if this bank has the strict top total in
+    # its company AND share >= threshold. Ties (rare with integer counts)
+    # are broken by total desc then originals desc.
+    multi_bank = counts["company_bank_count"] >= 2
+    lead_keys: set = set()
+    if multi_bank.any():
+        sub = counts.loc[multi_bank].copy()
+        sub = sub.sort_values(
+            by=["_company_key", "total_filings", "ORIGINAL"],
+            ascending=[True, False, False],
+        )
+        top_per_company = sub.drop_duplicates("_company_key", keep="first")
+
+        lead_candidates = top_per_company[
+            top_per_company["share_of_company"] >= threshold
+        ].copy()
+
+        if len(lead_candidates):
+            # Tie-check: ensure no other bank in the same company has the
+            # same total_filings as the candidate top.
+            candidate_keys = list(zip(
+                lead_candidates["_company_key"].tolist(),
+                lead_candidates["total_filings"].tolist(),
+            ))
+            tie_lookup = (
+                counts.groupby(["_company_key", "total_filings"]).size()
+                .rename("n_at_total").reset_index()
+            )
+            # Use a row-positional zip to avoid itertuples renaming `_company_key`
+            # (it strips leading underscores from column names).
+            tie_lookup_map = dict(zip(
+                zip(tie_lookup["_company_key"].tolist(),
+                    tie_lookup["total_filings"].tolist()),
+                tie_lookup["n_at_total"].tolist(),
+            ))
+            unique_mask = [
+                tie_lookup_map.get((ck, tf), 0) == 1
+                for ck, tf in candidate_keys
+            ]
+            lead_candidates = lead_candidates[pd.Series(unique_mask, index=lead_candidates.index)]
+
+            lead_keys = set(zip(
+                lead_candidates["_company_key"].tolist(),
+                lead_candidates["_bank_name"].tolist(),
+            ))
+
+            row_keys = list(zip(counts["_company_key"], counts["_bank_name"]))
+            lead_rows_mask = pd.Series(
+                [k in lead_keys for k in row_keys],
+                index=counts.index,
+            )
+            counts.loc[lead_rows_mask, "is_lead_bank"] = True
+            # Populate per-row reason with the actual share / total.
+            for idx in counts.index[lead_rows_mask]:
+                counts.at[idx, "lead_bank_reason"] = (
+                    f"Dominant bank: {counts.at[idx, 'share_of_company']:.0%} "
+                    f"share across {int(counts.at[idx, 'total_filings'])} filings"
+                )
+
+        # Multi-bank companies with no winner -> record reason.
+        winner_companies = {k for (k, _) in lead_keys}
+        no_winner_companies = set(top_per_company["_company_key"]) - winner_companies
+        if no_winner_companies:
+            no_winner_mask = (
+                counts["_company_key"].isin(no_winner_companies)
+                & (counts["lead_bank_reason"] == "")
+            )
+            counts.loc[no_winner_mask, "lead_bank_reason"] = (
+                f"No bank >= {threshold:.0%} share"
+            )
+
+    # ------------------------------------------------------------------
+    # 7. Final tidy: rename internal columns, order output.
+    # ------------------------------------------------------------------
+    out = counts.rename(
+        columns={
+            "_bank_name": "bank_name",
+            "ORIGINAL": "originals",
+            "CONTINUATION": "continuations",
+            "OTHER": "other_filings",
+        }
+    )
+    # 'Firm_ID' here would refer to the *debtor* Firm_ID, which the pipeline
+    # does not resolve (the matching pipeline maps secured parties only).
+    # We leave the column for forward-compatibility but blank for now.
+    out["Firm_ID"] = pd.NA
+    if "company_state" not in out.columns:
+        out["company_state"] = pd.NA
+
+    ordered = [
+        "Firm_ID", "company_name", "company_state",
+        "bank_name", "bank_firm_id",
+        "originals", "continuations", "other_filings", "total_filings",
+        "company_total_filings", "company_bank_count",
+        "share_of_company", "is_lead_bank", "lead_bank_reason",
+    ]
+    ordered = [c for c in ordered if c in out.columns]
+    out = (
+        out[ordered]
+        .sort_values(
+            by=["company_name", "total_filings"],
+            ascending=[True, False],
+            na_position="last",
+        )
+        .reset_index(drop=True)
+    )
+
+    # ------------------------------------------------------------------
+    # 8. Write CSVs (per-bank counts + per-company lead summary).
+    # ------------------------------------------------------------------
+    bank_counts_path = output_dir / f"bank_filing_counts_{timestamp}.csv"
+    out.to_csv(bank_counts_path, index=False)
+    context.log.info(
+        f"Lead-bank stage: wrote per-(company, bank) counts -> {bank_counts_path}"
+    )
+
+    leads_only = out[out["is_lead_bank"]].copy()
+    if len(leads_only):
+        leads_only = leads_only.sort_values(
+            ["company_name", "total_filings"], ascending=[True, False]
+        ).drop_duplicates(
+            subset=[c for c in ["company_name", "company_state"] if c in leads_only.columns],
+            keep="first",
+        )
+    leads_path = output_dir / f"lead_bank_by_company_{timestamp}.csv"
+    leads_only.to_csv(leads_path, index=False)
+    context.log.info(
+        f"Lead-bank stage: wrote per-company lead designation "
+        f"({len(leads_only):,} companies with a lead) -> {leads_path}"
+    )
+
+    # ------------------------------------------------------------------
+    # 9. Summary log + Dagster metadata.
+    # ------------------------------------------------------------------
+    company_id_cols = [c for c in ["company_name", "company_state"] if c in out.columns]
+    n_companies = (
+        int(out[company_id_cols].drop_duplicates().shape[0]) if company_id_cols else 0
+    )
+    n_pairs = len(out)
+    n_leads = int(out["is_lead_bank"].sum())
+    n_originals = int(out["originals"].sum())
+    n_continuations = int(out["continuations"].sum())
+    context.log.info(
+        f"Lead-bank summary: {n_companies:,} companies | {n_pairs:,} (company, bank) pairs | "
+        f"{n_originals:,} originals + {n_continuations:,} continuations | "
+        f"{n_leads:,} lead-bank rows designated (threshold = {threshold:.0%})"
+    )
+
+    return Output(
+        value=out,
+        metadata={
+            "companies": MetadataValue.int(n_companies),
+            "company_bank_pairs": MetadataValue.int(n_pairs),
+            "originals": MetadataValue.int(n_originals),
+            "continuations": MetadataValue.int(n_continuations),
+            "lead_bank_rows": MetadataValue.int(n_leads),
+            "threshold": MetadataValue.float(threshold),
+            "filing_type_column": MetadataValue.text(filing_type_col or "<none found>"),
+            "debtor_column": MetadataValue.text(debtor_col or "<none found>"),
+            "bank_counts_csv": MetadataValue.path(str(bank_counts_path)),
+            "lead_bank_csv": MetadataValue.path(str(leads_path)),
+        },
+    )
+
+
 @asset(
     description="Generate output files for different confidence levels",
     compute_kind="io",
