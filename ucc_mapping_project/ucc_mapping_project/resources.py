@@ -92,3 +92,54 @@ class PipelineConfig(ConfigurableResource):
     cluster_hnsw_m: int = Field(default=32, description="HNSW M parameter")
     cluster_hnsw_ef_search: int = Field(default=128, description="HNSW efSearch parameter")
     cluster_hnsw_ef_construction: int = Field(default=200, description="HNSW efConstruction parameter")
+
+    # Stage 4 advanced-match performance / accuracy upgrades
+    advanced_use_per_state_faiss: bool = Field(
+        default=True,
+        description="Build a FAISS IndexFlatIP per state-pair in master_embeddings_cache and "
+                    "use it in Stage 4 instead of repeated np.matmul calls. Mathematically "
+                    "identical to the matmul path; ~20-30% faster wall-clock at scale."
+    )
+    advanced_per_state_min_size: int = Field(
+        default=64,
+        description="State-pair sizes below this stay on the legacy matmul path — building a "
+                    "FAISS index for tiny groups is more overhead than the search saves."
+    )
+    query_embed_cache_enabled: bool = Field(
+        default=True,
+        description="Persist (model, query_norm) -> embedding to disk across runs so re-running "
+                    "Stage 4 on the same UCC inputs skips the SentenceTransformer encode step."
+    )
+    query_embed_cache_path: str = Field(
+        default=str(_PROJECT_ROOT / ".cache" / "query_embeddings"),
+        description="Directory for the persistent query embedding cache. One .npy + one .json "
+                    "shard per embedding model id (sanitised)."
+    )
+    # Cross-encoder rerank for REVIEW_MEDIUM band
+    advanced_cross_encoder_enabled: bool = Field(
+        default=True,
+        description="After Stage 4 selects a match, re-score REVIEW_MEDIUM rows with a small "
+                    "cross-encoder over the top candidates. May promote matches to REVIEW_HIGH "
+                    "or AUTO (never demotes). Safe to leave on — turns into a no-op if the "
+                    "cross-encoder model is not available locally."
+    )
+    advanced_cross_encoder_model: str = Field(
+        default="cross-encoder/ms-marco-MiniLM-L-6-v2",
+        description="HuggingFace model id (or local path) for the rerank cross-encoder. The "
+                    "ms-marco-MiniLM-L-6 default is small (~80MB) and CPU-friendly."
+    )
+    advanced_cross_encoder_top_n: int = Field(
+        default=10,
+        description="Number of top candidates per REVIEW_MEDIUM query to feed the cross-encoder."
+    )
+    advanced_cross_encoder_promote_to_auto: float = Field(
+        default=0.92,
+        description="Cross-encoder relevance score above which a REVIEW_MEDIUM match is promoted "
+                    "to AUTO. Cross-encoder outputs are typically in [-10, +10] passed through "
+                    "a sigmoid; we read the sigmoid score (0..1)."
+    )
+    advanced_cross_encoder_promote_to_high: float = Field(
+        default=0.80,
+        description="Cross-encoder score above which a REVIEW_MEDIUM match is promoted to "
+                    "REVIEW_HIGH. Must be < promote_to_auto."
+    )
