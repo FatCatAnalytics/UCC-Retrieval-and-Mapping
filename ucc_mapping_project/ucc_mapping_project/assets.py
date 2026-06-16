@@ -494,9 +494,12 @@ def exact_match_normalized_results(
     matches = norm_keys[unmatched_mask].map(norm_to_mapped)
     matched_mask = unmatched_mask & matches.notna().reindex(df.index, fill_value=False)
     
-    df.loc[matched_mask, 'SECP_NAME_MAPPED'] = norm_keys[matched_mask].map(norm_to_mapped)
-    df.loc[matched_mask, 'matched_master_raw'] = norm_keys[matched_mask].map(norm_to_raw)
-    df.loc[matched_mask, 'Firm_ID'] = norm_keys[matched_mask].map(norm_to_firm_id)
+    # Wrap RHS in list() so pandas does element-wise dtype coercion;
+    # otherwise int-valued Firm_IDs raise LossySetitemError against the
+    # float64 column (pandas >= 2.2 strict casting).
+    df.loc[matched_mask, 'SECP_NAME_MAPPED'] = list(norm_keys[matched_mask].map(norm_to_mapped))
+    df.loc[matched_mask, 'matched_master_raw'] = list(norm_keys[matched_mask].map(norm_to_raw))
+    df.loc[matched_mask, 'Firm_ID'] = list(norm_keys[matched_mask].map(norm_to_firm_id))
     df.loc[matched_mask, 'match_score'] = 1.0
     
     matched_norm_keys = norm_keys[matched_mask]
@@ -1836,7 +1839,10 @@ def universe_enriched_results(
 
         has_mapped_firm = mapped_firm_secp.notna()
 
-        df.loc[has_mapped_firm, "Firm_ID"] = mapped_firm_secp[has_mapped_firm]
+        # Wrap RHS in list() so pandas does element-wise dtype coercion;
+        # otherwise a numpy int array triggers LossySetitemError against the
+        # float64 column when NaNs are present (pandas >= 2.2 strict casting).
+        df.loc[has_mapped_firm, "Firm_ID"] = list(mapped_firm_secp[has_mapped_firm])
 
         pass1_firm = int(has_mapped_firm.sum())
         context.log.info(
@@ -1854,7 +1860,9 @@ def universe_enriched_results(
 
     fill_raw_firm = df["Firm_ID"].isna() & raw_firm.notna()
 
-    df.loc[fill_raw_firm, "Firm_ID"] = raw_firm[fill_raw_firm]
+    # Wrap RHS in list() so pandas does element-wise dtype coercion against
+    # the float64 column (see note in Pass 1).
+    df.loc[fill_raw_firm, "Firm_ID"] = list(raw_firm[fill_raw_firm])
 
     pass2_firm = int(fill_raw_firm.sum())
     context.log.info(
