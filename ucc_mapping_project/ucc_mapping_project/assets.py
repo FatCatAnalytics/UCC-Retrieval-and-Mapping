@@ -16,12 +16,16 @@ os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['VECLIB_MAXIMUM_THREADS'] = '1'  # macOS Accelerate framework
 os.environ['NUMEXPR_NUM_THREADS'] = '1'
 from datetime import datetime
+from collections import defaultdict
 from .utils import (
     soundex,
     detect_entity_type,
     normalize_name,
     generate_ngrams,
+    generate_ngrams_frozen,
     get_meaningful_words,
+    _get_meaningful_words_frozen,
+    _long_tokens,
     ngram_similarity,
     tfidf_ngram_similarity,
     has_shared_meaningful_identifier,
@@ -29,10 +33,13 @@ from .utils import (
     extract_acronym,
     is_acronym_match,
     compute_match_score,
+    compute_match_score_fast,
     combined_fuzzy_score,
     min_token_overlap,
     entity_types_compatible,
-    should_merge_clusters
+    should_merge_clusters,
+    build_tfidf_vec,
+    ENTITY_TYPE_WORDS,
 )
 from .models.data_structures import NGramIndex, UnionFind, TFIDFNGramIndex
 from .resources import PipelineConfig
@@ -353,13 +360,42 @@ def master_embeddings_cache(
         # Compute soundex in parallel
         master_soundex = compute_soundex_batch(master_normalized_list)
 
+    # Switch n-gram index to vectorised numpy query mode (big speedup in Stage 4)
+    ngram_index.freeze()
+
     # Build TF-IDF weighted n-gram index for better n-gram similarity
     context.log.info("Building TF-IDF n-gram index...")
     tfidf_index = TFIDFNGramIndex(n=3)
     for i, name in enumerate(master_normalized_list):
         tfidf_index.add(i, name)
     tfidf_index.freeze()
-    context.log.info(f"  TF-IDF index: {len(tfidf_index._idf):,} unique n-grams weighted")
+    # Pre-compute per-master TF-IDF vectors so Stage 4 doesn't re-tokenise.
+    master_tfidf_vecs, master_tfidf_norms = tfidf_index.build_vectors()
+    context.log.info(
+        f"  TF-IDF index: {len(tfidf_index._idf):,} unique n-grams weighted, "
+        f"{len(master_tfidf_vecs):,} master vectors pre-built"
+    )
+
+    # --- Master-side derived features ----------------------------------------
+    # Building these once at cache time turns Stage 3/4/6 inner loops from
+    # Python-heavy into pure dict/array lookups.
+    context.log.info("Pre-computing master-side derived features...")
+    master_long_tokens = [_long_tokens(n) for n in master_normalized_list]
+    master_meaningful_words = [_get_meaningful_words_frozen(n) for n in master_normalized_list]
+    master_entity_cores = [extract_entity_core(n) for n in master_normalized_list]
+
+    # Token → master_id inverted index for fast token-based blocking in Stage 3/4.
+    # Uses meaningful tokens only (drops generic noise like BANK/INC).
+    token_to_master_ids: Dict[str, np.ndarray] = {}
+    token_to_ids_build: Dict[str, list] = defaultdict(list)
+    for idx, toks in enumerate(master_meaningful_words):
+        for tok in toks:
+            token_to_ids_build[tok].append(idx)
+    for tok, ids in token_to_ids_build.items():
+        token_to_master_ids[tok] = np.asarray(ids, dtype=np.int64)
+    context.log.info(
+        f"  Token block index: {len(token_to_master_ids):,} unique tokens"
+    )
 
     context.log.info(f"Master embeddings cache ready: {master_embeddings.shape}")
 
@@ -368,6 +404,12 @@ def master_embeddings_cache(
         'faiss_index': faiss_index,
         'ngram_index': ngram_index,
         'tfidf_idf_weights': tfidf_index._idf,  # pass IDF weights for compute_match_score
+        'master_tfidf_vecs': master_tfidf_vecs,
+        'master_tfidf_norms': master_tfidf_norms,
+        'master_long_tokens': master_long_tokens,
+        'master_meaningful_words': master_meaningful_words,
+        'master_entity_cores': master_entity_cores,
+        'token_to_master_ids': token_to_master_ids,
         'soundex': master_soundex,
         'model': model,
     }
@@ -502,8 +544,18 @@ def fuzzy_match_results(
         config: PipelineConfig,
         exact_match_normalized_results: pd.DataFrame,
         normalized_master_data: dict,
+        master_embeddings_cache: dict,
 ) -> pd.DataFrame:
-    """Stage 3: Fuzzy matching with enhanced false positive prevention."""
+    """Stage 3: Fuzzy matching with enhanced false-positive prevention.
+
+    Performance:
+      * Token-based blocking via ``token_to_master_ids`` collapses the
+        ``Q x M_state`` matrix into ``Q x C`` where C is typically 5-50x smaller.
+      * ``process.cdist`` runs with ``dtype=np.uint8`` and ``workers=-1``
+        (rapidfuzz releases the GIL).
+      * All ``df.loc`` writes are deferred and applied in a single vectorised
+        pass at the end - eliminates ~7 Pandas indexer calls per matched row.
+    """
     from rapidfuzz import process, fuzz
 
     df = exact_match_normalized_results.copy()
@@ -522,13 +574,22 @@ def fuzzy_match_results(
     norm_to_mapped_candidates = normalized_master_data['norm_to_mapped_candidates']
     state_pair_to_indices = normalized_master_data['state_pair_to_indices']
 
+    # Cached master-side features (built in master_embeddings_cache asset)
+    master_meaningful_words = master_embeddings_cache.get('master_meaningful_words')
+    master_entity_cores = master_embeddings_cache.get('master_entity_cores')
+    token_to_master_ids = master_embeddings_cache.get('token_to_master_ids')
+
     pending = df.loc[unmatched_mask, STATE_COLUMNS + ['SECP_NAME_NORMALIZED']].copy()
     pending['_match_key'] = _state_name_keys(pending, 'SECP_NAME_NORMALIZED', normalized=False)
-    key_to_indices = pending.groupby('_match_key').apply(lambda g: g.index.tolist()).to_dict()
+
+    # Fast key -> indices map (avoids groupby.apply which is slow for many groups)
+    key_to_indices: Dict[Any, list] = defaultdict(list)
+    for row_idx, key in zip(pending.index.to_numpy(), pending['_match_key'].to_numpy()):
+        key_to_indices[key].append(row_idx)
+
     unique_pending = pending.drop_duplicates('_match_key', keep='first')
 
     queries = unique_pending['SECP_NAME_NORMALIZED'].tolist()
-    indices = unique_pending.index.tolist()
     query_keys = unique_pending['_match_key'].tolist()
     query_state_pairs = _state_pair_keys(unique_pending).tolist()
 
@@ -538,140 +599,207 @@ def fuzzy_match_results(
             f"Stage 3 - Fuzzy Match: deduped {deduped_count:,} repeated normalized state/name records"
         )
 
-    # Pre-compute entity types for all queries
+    # Pre-compute query metadata once (cached at utils level too)
     query_entity_types = [detect_entity_type(q) for q in queries]
+    query_meaningful_words = [_get_meaningful_words_frozen(q) for q in queries]
+    query_entity_cores = [extract_entity_core(q) for q in queries]
 
+    # --- Stage scratch arrays (numpy-backed, no df.loc churn in hot loop) ---
+    n_rows = len(df)
+    pending_pos = df.index.get_indexer(pending.index)  # positions of pending rows in df
+    # Build write buffers keyed by *df position*; flushed at the end.
+    write_mapped = np.empty(n_rows, dtype=object); write_mapped.fill(None)
+    write_raw = np.empty(n_rows, dtype=object); write_raw.fill(None)
+    write_firm = np.empty(n_rows, dtype=object); write_firm.fill(None)
+    write_score = np.full(n_rows, np.nan, dtype=float)
+    write_method = np.empty(n_rows, dtype=object); write_method.fill(None)
+    write_conf = np.empty(n_rows, dtype=object); write_conf.fill(None)
+    write_ambig = np.empty(n_rows, dtype=object); write_ambig.fill(None)
+    pos_index = df.index.get_indexer(df.index)  # identity; used below as np.array fast lookup
+    df_index_to_pos = {idx: pos for pos, idx in enumerate(df.index.tolist())}
+
+    FUZZY_COMBINED_MIN = 85.0
     auto_count = 0
     review_count = 0
-    rejected_count = 0  # Track rejections for debugging
+    rejected_count = 0
 
+    fuzzy_workers = config.fuzzy_workers if config.fuzzy_workers else -1
     batch_size = max(1, config.fuzzy_batch_size)
+    review_threshold = config.fuzzy_review_threshold
+    auto_threshold = config.fuzzy_auto_threshold
+
     for start in range(0, len(queries), batch_size):
         end = min(start + batch_size, len(queries))
         batch_queries = queries[start:end]
-        batch_indices = indices[start:end]
         batch_keys = query_keys[start:end]
         batch_query_types = query_entity_types[start:end]
-
         batch_state_pairs = query_state_pairs[start:end]
+        batch_query_words = query_meaningful_words[start:end]
+        batch_query_cores = query_entity_cores[start:end]
 
-        positions_by_state_pair = {}
+        # Group positions by state pair, then within each state group additionally
+        # block by token overlap to slash candidate counts.
+        positions_by_state_pair: Dict[Any, list] = defaultdict(list)
         for pos, state_pair in enumerate(batch_state_pairs):
-            positions_by_state_pair.setdefault(state_pair, []).append(pos)
+            positions_by_state_pair[state_pair].append(pos)
 
         for state_pair, positions in positions_by_state_pair.items():
-            candidate_indices = state_pair_to_indices.get(state_pair, [])
-            if not candidate_indices:
+            state_candidate_arr = state_pair_to_indices.get(state_pair, [])
+            if len(state_candidate_arr) == 0:
                 continue
+            state_candidate_set = set(state_candidate_arr)
 
-            candidate_names = [master_normalized_list[candidate_idx] for candidate_idx in candidate_indices]
-            candidate_types = [master_entity_types[candidate_idx] for candidate_idx in candidate_indices]
-            sub_queries = [batch_queries[pos] for pos in positions]
-
-            scores = process.cdist(
-                sub_queries,
-                candidate_names,
-                scorer=fuzz.token_sort_ratio,
-                score_cutoff=config.fuzzy_review_threshold,
-                workers=config.fuzzy_workers
-            )
-
-            if scores.size == 0 or np.max(scores) < config.fuzzy_review_threshold:
-                continue
-
-            best_idx = scores.argmax(axis=1)
-            best_scores = scores[np.arange(len(sub_queries)), best_idx]
-
-            for sub_i, pos in enumerate(positions):
-                idx = batch_indices[pos]
-                update_indices = key_to_indices[batch_keys[pos]]
-                score = float(best_scores[sub_i])
-                if score < config.fuzzy_review_threshold:
-                    continue
-
-                match_idx = int(candidate_indices[int(best_idx[sub_i])])
-                match_norm = master_normalized_list[match_idx]
-                query_name = batch_queries[pos]
-
-                # Entity type gating
-                query_type = batch_query_types[pos]
-                match_type = candidate_types[int(best_idx[sub_i])]
-                if not entity_types_compatible(query_type, match_type):
-                    rejected_count += 1
-                    continue
-
-                # ENHANCED FALSE POSITIVE PREVENTION
-                # Check for meaningful identifier overlap
-                if not has_shared_meaningful_identifier(query_name, match_norm):
-                    context.log.debug(f"Rejected: '{query_name}' -> '{match_norm}' (no shared meaningful identifiers)")
-                    rejected_count += 1
-                    continue
-
-                # Use enhanced combined fuzzy score
-                combined_score = combined_fuzzy_score(query_name, match_norm)
-
-                # CRITICAL: Minimum combined score to prevent false positives
-                # combined_fuzzy_score returns 0-100 scale; require at least 85
-                FUZZY_COMBINED_MIN = 85.0
-                if combined_score < FUZZY_COMBINED_MIN:
-                    context.log.debug(
-                        f"Rejected: '{query_name}' -> '{match_norm}' (combined score {combined_score:.1f} < {FUZZY_COMBINED_MIN})")
-                    rejected_count += 1
-                    continue
-
-                # Additional check for entity core mismatch
-                query_core = extract_entity_core(query_name)
-                match_core = extract_entity_core(match_norm)
-
-                if query_core != match_core and len(query_core) > 2 and len(match_core) > 2:
-                    # Check if cores are similar (allow for minor variations)
-                    core_similarity = fuzz.ratio(query_core, match_core)
-                    if core_similarity < 70:
-                        # Only allow if it's a clear acronym match
-                        if not (is_acronym_match(query_core, match_core) or is_acronym_match(match_core, query_core)):
-                            context.log.debug(
-                                f"Rejected: '{query_name}' -> '{match_norm}' (core mismatch: '{query_core}' vs '{match_core}')")
-                            rejected_count += 1
-                            continue
-
-                final_score = combined_score
-                match_key = (state_pair[0], state_pair[1], match_norm)
-                is_ambiguous = match_key in ambiguous_norms
-
-                df.loc[update_indices, 'SECP_NAME_MAPPED'] = norm_to_mapped.get(match_key)
-                df.loc[update_indices, 'matched_master_raw'] = norm_to_raw.get(match_key)
-                df.loc[update_indices, 'Firm_ID'] = norm_to_firm_id.get(match_key)
-                df.loc[update_indices, 'match_score'] = final_score / 100.0
-
-                if is_ambiguous:
-                    df.loc[update_indices, 'match_method'] = 'Fuzzy Match (Ambiguous)'
-                    df.loc[update_indices, 'confidence'] = 'REVIEW_HIGH'
-
-                    candidates_raw = norm_to_mapped_candidates.get(match_key, [])
-                    if candidates_raw:
-                        valid_candidates = []
-                        for candidate in candidates_raw:
-                            if candidate is not None:
-                                if isinstance(candidate, float) and pd.isna(candidate):
-                                    continue
-                                valid_candidates.append(str(candidate))
-
-                        df.loc[update_indices, 'ambiguous_master_candidates'] = "; ".join(valid_candidates)
-                    else:
-                        df.loc[update_indices, 'ambiguous_master_candidates'] = ""
-
-                    review_count += len(update_indices)
-                elif final_score >= config.fuzzy_auto_threshold:
-                    df.loc[update_indices, 'match_method'] = 'Fuzzy Match'
-                    df.loc[update_indices, 'confidence'] = 'AUTO'
-                    auto_count += len(update_indices)
+            # ---- Per-query token blocking ------------------------------------
+            # For each query, compute its candidate subset within this state.
+            # Then group queries that share the *same* candidate set into one
+            # cdist call - dramatically cheaper than per-query process.extract.
+            per_query_candidates: list = []
+            for pos in positions:
+                qwords = batch_query_words[pos]
+                if not qwords or token_to_master_ids is None:
+                    cand_ids = state_candidate_set
                 else:
-                    df.loc[update_indices, 'match_method'] = 'Fuzzy Match'
-                    df.loc[update_indices, 'confidence'] = 'REVIEW_HIGH'
-                    review_count += len(update_indices)
+                    cand_ids = set()
+                    for tok in qwords:
+                        arr = token_to_master_ids.get(tok)
+                        if arr is not None:
+                            cand_ids.update(arr.tolist())
+                    cand_ids &= state_candidate_set
+                    if not cand_ids:
+                        # No token-block hit - fall back to whole state pool
+                        # (preserves recall vs old code)
+                        cand_ids = state_candidate_set
+                per_query_candidates.append(cand_ids)
+
+            # Group queries by identical candidate sets (heavy dedup expected
+            # because many queries share the same meaningful tokens)
+            grouped: Dict[frozenset, list] = defaultdict(list)
+            for local_pos, cand in zip(positions, per_query_candidates):
+                grouped[frozenset(cand)].append(local_pos)
+
+            for cand_fset, group_positions in grouped.items():
+                if not cand_fset:
+                    continue
+                cand_list = list(cand_fset)
+                candidate_names = [master_normalized_list[i] for i in cand_list]
+                sub_queries = [batch_queries[p] for p in group_positions]
+
+                scores = process.cdist(
+                    sub_queries,
+                    candidate_names,
+                    scorer=fuzz.token_sort_ratio,
+                    score_cutoff=review_threshold,
+                    workers=fuzzy_workers,
+                    dtype=np.uint8,
+                )
+                if scores.size == 0:
+                    continue
+                # uint8 scores 0..100; quick max gate
+                row_max = scores.max(axis=1)
+                if row_max.max() < review_threshold:
+                    continue
+
+                best_idx = scores.argmax(axis=1)
+
+                for sub_i, pos in enumerate(group_positions):
+                    score = int(row_max[sub_i])
+                    if score < review_threshold:
+                        continue
+
+                    match_local = int(best_idx[sub_i])
+                    match_idx = cand_list[match_local]
+                    match_norm = master_normalized_list[match_idx]
+                    query_name = batch_queries[pos]
+
+                    # Entity-type gating
+                    query_type = batch_query_types[pos]
+                    match_type = master_entity_types[match_idx]
+                    if not entity_types_compatible(query_type, match_type):
+                        rejected_count += 1
+                        continue
+
+                    # Meaningful-identifier overlap (uses frozensets)
+                    if not has_shared_meaningful_identifier(query_name, match_norm):
+                        rejected_count += 1
+                        continue
+
+                    # Combined fuzzy score (cached)
+                    combined_score = combined_fuzzy_score(query_name, match_norm)
+                    if combined_score < FUZZY_COMBINED_MIN:
+                        rejected_count += 1
+                        continue
+
+                    # Entity-core mismatch guard
+                    query_core = batch_query_cores[pos]
+                    match_core = master_entity_cores[match_idx] if master_entity_cores else extract_entity_core(match_norm)
+                    if query_core != match_core and len(query_core) > 2 and len(match_core) > 2:
+                        if fuzz.ratio(query_core, match_core) < 70:
+                            if not (is_acronym_match(query_core, match_core)
+                                    or is_acronym_match(match_core, query_core)):
+                                rejected_count += 1
+                                continue
+
+                    final_score = combined_score
+                    match_key = (state_pair[0], state_pair[1], match_norm)
+                    is_ambiguous = match_key in ambiguous_norms
+
+                    update_indices = key_to_indices[batch_keys[pos]]
+                    update_positions = np.fromiter(
+                        (df_index_to_pos[i] for i in update_indices),
+                        dtype=np.int64,
+                        count=len(update_indices),
+                    )
+
+                    mapped_val = norm_to_mapped.get(match_key)
+                    raw_val = norm_to_raw.get(match_key)
+                    firm_val = norm_to_firm_id.get(match_key)
+
+                    write_mapped[update_positions] = mapped_val
+                    write_raw[update_positions] = raw_val
+                    write_firm[update_positions] = firm_val
+                    write_score[update_positions] = final_score / 100.0
+
+                    if is_ambiguous:
+                        write_method[update_positions] = 'Fuzzy Match (Ambiguous)'
+                        write_conf[update_positions] = 'REVIEW_HIGH'
+
+                        candidates_raw = norm_to_mapped_candidates.get(match_key, [])
+                        if candidates_raw:
+                            valid_candidates = [
+                                str(c) for c in candidates_raw
+                                if c is not None and not (isinstance(c, float) and pd.isna(c))
+                            ]
+                            write_ambig[update_positions] = "; ".join(valid_candidates)
+                        else:
+                            write_ambig[update_positions] = ""
+                        review_count += len(update_indices)
+                    elif final_score >= auto_threshold:
+                        write_method[update_positions] = 'Fuzzy Match'
+                        write_conf[update_positions] = 'AUTO'
+                        auto_count += len(update_indices)
+                    else:
+                        write_method[update_positions] = 'Fuzzy Match'
+                        write_conf[update_positions] = 'REVIEW_HIGH'
+                        review_count += len(update_indices)
+
+    # --- Single vectorised flush of all writes to the dataframe ---
+    written = write_method != None  # noqa: E711 - object-dtype None compare
+    if written.any():
+        idx_to_write = df.index[written]
+        df.loc[idx_to_write, 'SECP_NAME_MAPPED'] = write_mapped[written]
+        df.loc[idx_to_write, 'matched_master_raw'] = write_raw[written]
+        df.loc[idx_to_write, 'Firm_ID'] = write_firm[written]
+        df.loc[idx_to_write, 'match_score'] = write_score[written]
+        df.loc[idx_to_write, 'match_method'] = write_method[written]
+        df.loc[idx_to_write, 'confidence'] = write_conf[written]
+        ambig_mask = write_ambig != None  # noqa: E711
+        if ambig_mask.any():
+            df.loc[df.index[ambig_mask], 'ambiguous_master_candidates'] = write_ambig[ambig_mask]
 
     context.log.info(
-        f"Stage 3 - Fuzzy Match: {auto_count:,} auto + {review_count:,} review (rejected {rejected_count:,} false positives)")
+        f"Stage 3 - Fuzzy Match: {auto_count:,} auto + {review_count:,} review "
+        f"(rejected {rejected_count:,} false positives)"
+    )
 
     return df
 
@@ -689,7 +817,15 @@ def advanced_embedding_results(
     normalized_master_data: dict,
     master_embeddings_cache: dict,
 ) -> pd.DataFrame:
-    """Stage 4: Advanced multi-signal matching."""
+    """Stage 4: Advanced multi-signal matching (optimized).
+
+    Optimisations applied:
+    - Reuses precomputed master features from cache (soundex, TF-IDF vecs, entity types).
+    - Precomputes per-query TF-IDF vec + soundex once.
+    - Uses `compute_match_score_fast` to avoid rebuilding vectors per candidate.
+    - Defers all per-row `df.loc` writes via numpy buffers; single vectorised flush at end.
+    - Bumps gc cadence from every 500 batches to every 5,000 queries.
+    """
     import os
     from concurrent.futures import ThreadPoolExecutor
 
@@ -700,12 +836,12 @@ def advanced_embedding_results(
         os.environ['MKL_NUM_THREADS'] = str(config.cpu_threads)
 
     df = fuzzy_match_results.copy()
-    
+
     unmatched_mask = _pending_match_mask(df)
     if not unmatched_mask.any():
         context.log.info("Stage 4 - Advanced Match: 0 matches (none to process)")
         return df
-    
+
     master_normalized_list = normalized_master_data['normalized_list']
     master_mapped_list = normalized_master_data['mapped_list']
     master_raw_list = normalized_master_data['raw_list']
@@ -713,20 +849,21 @@ def advanced_embedding_results(
     master_entity_types = normalized_master_data['entity_types']
     master_state_pair_list = normalized_master_data['state_pair_list']
     state_pair_to_indices = normalized_master_data['state_pair_to_indices']
-    
+
     if not master_normalized_list:
         context.log.info("Stage 4 - Advanced Match: 0 matches (no master data)")
         return df
 
-    # Use pre-computed embeddings and indexes from cache (NO duplicate computation)
+    # Pull pre-computed artefacts from cache (single source of truth)
     master_embeddings = master_embeddings_cache.get('embeddings')
-    faiss_index = master_embeddings_cache.get('faiss_index')
     ngram_index = master_embeddings_cache.get('ngram_index')
     master_soundex = master_embeddings_cache.get('soundex')
     model = master_embeddings_cache.get('model')
-    tfidf_idf_weights = master_embeddings_cache.get('tfidf_idf_weights')  # TF-IDF n-gram weights
-    
-    # Fallback: If model failed to deserialize, reload it
+    tfidf_idf_weights = master_embeddings_cache.get('tfidf_idf_weights')
+    master_tfidf_vecs = master_embeddings_cache.get('master_tfidf_vecs')
+    master_tfidf_norms = master_embeddings_cache.get('master_tfidf_norms')
+
+    # Fallback: model reload
     if model is None:
         from sentence_transformers import SentenceTransformer
         context.log.warning("Model not found in cache, reloading...")
@@ -735,7 +872,6 @@ def advanced_embedding_results(
         except Exception:
             model = SentenceTransformer('BAAI/bge-small-en-v1.5', device='cpu')
 
-    # Fallback: If embeddings/index failed to deserialize, rebuild them
     if master_embeddings is None:
         context.log.error("Critical: Master embeddings cache is invalid!")
         return df
@@ -744,8 +880,8 @@ def advanced_embedding_results(
         ngram_index = NGramIndex(n=3)
         for i, name in enumerate(master_normalized_list):
             ngram_index.add(i, name)
+        ngram_index.freeze()
 
-    # Fallback: Rebuild soundex if needed
     if master_soundex is None:
         master_soundex = [soundex(name) for name in master_normalized_list]
 
@@ -767,14 +903,18 @@ def advanced_embedding_results(
 
     context.log.info(f"Matching {len(queries):,} records with CPU-optimized processing...")
 
-    # Pre-compute all query metadata in parallel
+    # Pre-compute all query metadata in parallel (soundex, type, ngram cands, tfidf vec)
     context.log.info("Pre-computing query metadata in parallel...")
 
     def compute_query_metadata(query):
+        q_vec, q_norm = (build_tfidf_vec(query, tfidf_idf_weights)
+                         if tfidf_idf_weights else ({}, 0.0))
         return {
             'soundex': soundex(query),
             'entity_type': detect_entity_type(query),
-            'ngram_candidates': set(ngram_index.query(query, min_overlap=2))
+            'ngram_candidates': set(ngram_index.query(query, min_overlap=2)),
+            'tfidf_vec': q_vec,
+            'tfidf_norm': q_norm,
         }
 
     with ThreadPoolExecutor(max_workers=config.embedding_workers) as executor:
@@ -782,10 +922,23 @@ def advanced_embedding_results(
 
     auto_count = high_count = medium_count = 0
     batch_size = config.embed_batch_size
-    batch_size = config.embed_batch_size
     top_k = max(1, min(config.embed_top_k, len(master_normalized_list)))
 
-    # Process in smaller batches for CPU efficiency
+    # Build df.index positional lookup once for fast numpy-buffer flushing.
+    df_index = df.index
+    df_pos_lookup = {orig_idx: pos for pos, orig_idx in enumerate(df_index)}
+    n_rows = len(df)
+
+    # Deferred write buffers (one entry per row). Use object dtype where strings are possible.
+    write_mapped = np.empty(n_rows, dtype=object)
+    write_raw = np.empty(n_rows, dtype=object)
+    write_firm = np.empty(n_rows, dtype=object)
+    write_score = np.full(n_rows, np.nan, dtype=np.float64)
+    write_method = np.empty(n_rows, dtype=object)
+    write_conf = np.empty(n_rows, dtype=object)
+    has_write = np.zeros(n_rows, dtype=bool)
+
+    # Process in batches for CPU efficiency
     for start in range(0, len(queries), batch_size):
         end = min(start + batch_size, len(queries))
         batch_queries = queries[start:end]
@@ -797,7 +950,7 @@ def advanced_embedding_results(
         # Encode batch (CPU optimized)
         query_embeddings = model.encode(
             batch_queries,
-            batch_size=128,  # Smaller batch for CPU
+            batch_size=128,
             normalize_embeddings=True,
             show_progress_bar=False,
             device='cpu'
@@ -821,12 +974,13 @@ def advanced_embedding_results(
 
             for row_pos, pos in enumerate(positions):
                 query_name = batch_queries[pos]
-                idx = batch_indices[pos]
                 update_indices = key_to_indices[batch_keys[pos]]
                 metadata = batch_metadata[pos]
                 query_soundex = metadata['soundex']
                 query_type = metadata['entity_type']
                 ngram_candidates = metadata['ngram_candidates']
+                q_tfidf_vec = metadata['tfidf_vec']
+                q_tfidf_norm = metadata['tfidf_norm']
 
                 sims = similarity_matrix[row_pos]
                 if len(candidate_array) > group_top_k:
@@ -862,41 +1016,53 @@ def advanced_embedding_results(
                 best_score = 0.0
                 best_match_idx = -1
 
-                # Process candidates with early termination
                 for cand_idx in sorted_candidates:
                     embed_sim = embed_sim_map[cand_idx]
-
-                    # Early termination conditions
                     if embed_sim < 0.70:
-                        break  # Remaining candidates will be even worse
-
+                        break
                     if best_score >= config.early_stop_threshold:
-                        break  # Found excellent match, stop searching
+                        break
 
                     master_name = master_normalized_list[cand_idx]
                     master_type = master_entity_types[cand_idx]
                     if master_state_pair_list[cand_idx] != state_pair:
                         continue
 
-                    # Fast pre-filters
                     if not entity_types_compatible(query_type, master_type):
                         continue
 
                     if embed_sim < 0.85 and not min_token_overlap(query_name, master_name, min_overlap=1):
                         continue
 
-                    # Compute multi-signal score (optimized, with TF-IDF n-grams)
-                    total_score, _ = compute_match_score(
-                        query_name, master_name, embed_sim,
-                        phonetic_weight=0.08,  # Slightly reduced for speed
-                        ngram_weight=0.12,
-                        fuzzy_weight=0.20,
-                        embed_weight=0.50,  # Increased embedding weight
-                        acronym_weight=0.10,
-                        idf_weights=tfidf_idf_weights,
-                    )
+                    # Use precomputed master tfidf vec/norm when available (skip rebuilding).
+                    if (master_tfidf_vecs is not None
+                            and master_tfidf_norms is not None
+                            and tfidf_idf_weights is not None):
+                        total_score = compute_match_score_fast(
+                            query_name, master_name, embed_sim,
+                            soundex1=query_soundex,
+                            soundex2=master_soundex[cand_idx],
+                            query_tfidf_vec=q_tfidf_vec,
+                            query_tfidf_norm=q_tfidf_norm,
+                            cand_tfidf_vec=master_tfidf_vecs[cand_idx],
+                            cand_tfidf_norm=master_tfidf_norms[cand_idx],
+                            phonetic_weight=0.08,
+                            ngram_weight=0.12,
+                            fuzzy_weight=0.20,
+                            embed_weight=0.50,
+                            acronym_weight=0.10,
+                        )
+                    else:
+                        total_score, _ = compute_match_score(
+                            query_name, master_name, embed_sim,
+                            phonetic_weight=0.08,
+                            ngram_weight=0.12,
+                            fuzzy_weight=0.20,
+                            embed_weight=0.50,
+                            acronym_weight=0.10,
+                            idf_weights=tfidf_idf_weights,
+                        )
 
-                    # Quick bonuses
                     if query_soundex == master_soundex[cand_idx]:
                         total_score += 0.05
                     if query_type == master_type and query_type != 'OTHER':
@@ -906,30 +1072,45 @@ def advanced_embedding_results(
                         best_score = total_score
                         best_match_idx = cand_idx
 
-                # Apply results
+                # Stage write into numpy buffers (no df.loc here)
                 if best_match_idx >= 0 and best_score >= config.embed_medium_threshold:
-                    df.loc[update_indices, 'SECP_NAME_MAPPED'] = master_mapped_list[best_match_idx]
-                    df.loc[update_indices, 'matched_master_raw'] = master_raw_list[best_match_idx]
-                    df.loc[update_indices, 'Firm_ID'] = master_firm_id_list[best_match_idx]
-                    df.loc[update_indices, 'match_score'] = best_score
-
+                    mapped_val = master_mapped_list[best_match_idx]
+                    raw_val = master_raw_list[best_match_idx]
+                    firm_val = master_firm_id_list[best_match_idx]
                     if best_score >= config.embed_auto_threshold:
-                        df.loc[update_indices, 'match_method'] = 'Advanced Match'
-                        df.loc[update_indices, 'confidence'] = 'AUTO'
+                        conf_val = 'AUTO'
                         auto_count += len(update_indices)
                     elif best_score >= config.embed_high_threshold:
-                        df.loc[update_indices, 'match_method'] = 'Advanced Match'
-                        df.loc[update_indices, 'confidence'] = 'REVIEW_HIGH'
+                        conf_val = 'REVIEW_HIGH'
                         high_count += len(update_indices)
                     else:
-                        df.loc[update_indices, 'match_method'] = 'Advanced Match'
-                        df.loc[update_indices, 'confidence'] = 'REVIEW_MEDIUM'
+                        conf_val = 'REVIEW_MEDIUM'
                         medium_count += len(update_indices)
 
-        # Progress and memory management
-        if start > 0 and start % 500 == 0:
+                    for orig_idx in update_indices:
+                        p = df_pos_lookup[orig_idx]
+                        write_mapped[p] = mapped_val
+                        write_raw[p] = raw_val
+                        write_firm[p] = firm_val
+                        write_score[p] = best_score
+                        write_method[p] = 'Advanced Match'
+                        write_conf[p] = conf_val
+                        has_write[p] = True
+
+        # Memory management — much less aggressive than the original
+        if start > 0 and start % 5000 == 0:
             gc.collect()
             context.log.info(f"    Processed {start + len(batch_queries):,} / {len(queries):,}")
+
+    # Single vectorised flush
+    if has_write.any():
+        mask = has_write
+        df.loc[df_index[mask], 'SECP_NAME_MAPPED'] = write_mapped[mask]
+        df.loc[df_index[mask], 'matched_master_raw'] = write_raw[mask]
+        df.loc[df_index[mask], 'Firm_ID'] = write_firm[mask]
+        df.loc[df_index[mask], 'match_score'] = write_score[mask]
+        df.loc[df_index[mask], 'match_method'] = write_method[mask]
+        df.loc[df_index[mask], 'confidence'] = write_conf[mask]
 
     context.log.info(f"Stage 4 - Advanced Match: {auto_count:,} auto, {high_count:,} high, {medium_count:,} medium")
 

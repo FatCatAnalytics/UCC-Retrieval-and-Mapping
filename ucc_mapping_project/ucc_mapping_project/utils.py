@@ -3,6 +3,7 @@
 # =============================================================================
 import re
 import math
+from functools import lru_cache
 from typing import List, Set, Dict, Tuple, Optional
 from difflib import SequenceMatcher
 from collections import Counter
@@ -15,6 +16,63 @@ from .constants import (
     ABBREVIATIONS,
     ENTITY_TYPE_PATTERNS
 )
+
+# =============================================================================
+# MODULE-LEVEL CONSTANTS
+# =============================================================================
+# Defining these once (frozensets) avoids re-building Python sets and re-running
+# set unions on every call from hot loops in Stages 3-7.
+
+# Tier 1: Entity type words - ALWAYS excluded from meaningful word sets.
+ENTITY_TYPE_WORDS = frozenset({
+    'bank', 'banking', 'trust', 'savings', 'credit', 'union',
+    'company', 'corporation', 'corp', 'inc', 'llc', 'ltd', 'limited',
+    'the', 'of', 'and', 'a', 'an',
+    'financial', 'services', 'group', 'holdings', 'capital', 'partners',
+    'investment', 'investments', 'management', 'fund', 'funds',
+    'advisory', 'advisors', 'asset', 'assets', 'lending', 'loan',
+    'equipment', 'finance', 'mortgage', 'solutions', 'associates',
+    'na', 'n.a.', 'fsb', 'ssb',
+})
+
+# Tier 2: Generic prefixes - excluded only when truly-unique words exist.
+GENERIC_PREFIXES = frozenset({
+    'american', 'united', 'us', 'usa', 'new', 'old', 'central',
+    'western', 'eastern', 'northern', 'southern', 'north', 'south',
+    'east', 'west', 'pacific', 'atlantic', 'continental', 'general',
+    'royal', 'premier', 'global', 'international', 'universal',
+    'great', 'greater', 'community', 'regional', 'state', 'metro',
+    'metropolitan', 'citizens', 'peoples', 'security', 'commerce',
+    'first', 'second', 'third', 'national', 'federal',
+})
+
+ALL_GENERIC = ENTITY_TYPE_WORDS | GENERIC_PREFIXES
+
+# Upper-case variants used by combined_fuzzy_score / extract_entity_core.
+SKIPPABLE_PREFIXES_UPPER = frozenset({
+    'THE', 'A', 'AN',
+    'AMERICAN', 'UNITED', 'US', 'USA', 'NEW', 'OLD', 'CENTRAL',
+    'WESTERN', 'EASTERN', 'NORTHERN', 'SOUTHERN', 'NORTH', 'SOUTH',
+    'EAST', 'WEST', 'PACIFIC', 'ATLANTIC', 'CONTINENTAL', 'GENERAL',
+    'ROYAL', 'PREMIER', 'GLOBAL', 'INTERNATIONAL', 'UNIVERSAL',
+    'GREAT', 'GREATER', 'COMMUNITY', 'REGIONAL', 'STATE', 'METRO',
+    'METROPOLITAN', 'CITIZENS', 'PEOPLES', 'SECURITY', 'COMMERCE',
+    'FIRST', 'SECOND', 'THIRD',
+})
+GENERIC_WORDS_UPPER = frozenset({
+    'BANK', 'BANKING', 'CORP', 'CORPORATION', 'INC', 'LLC', 'LTD', 'LIMITED',
+    'COMPANY', 'CO', 'TRUST', 'FINANCIAL', 'SERVICES', 'GROUP',
+    'EQUIPMENT', 'FINANCE', 'CAPITAL', 'INVESTMENT', 'FUND',
+    'NATIONAL', 'FEDERAL', 'STATE', 'COMMUNITY', 'COMMERCIAL',
+    'SAVINGS', 'CREDIT', 'UNION', 'LENDING', 'LOAN', 'MORTGAGE',
+    'HOLDINGS', 'PARTNERS', 'ASSOCIATES', 'SOLUTIONS',
+})
+ALL_GENERIC_UPPER = SKIPPABLE_PREFIXES_UPPER | GENERIC_WORDS_UPPER
+
+ACRONYM_SKIP_WORDS = frozenset({'THE', 'OF', 'AND', 'A', 'AN', 'IN', 'FOR', 'TO', 'BY'})
+
+# Cache size tuned for typical UCC dataset (~200K rows, heavy dedup expected)
+_CACHE_SIZE = 200_000
 
 
 def normalize_name(name: str) -> str:
@@ -49,6 +107,7 @@ def normalize_name(name: str) -> str:
     
     return name
 
+@lru_cache(maxsize=_CACHE_SIZE)
 def soundex(name: str) -> str:
     """Generate Soundex code for phonetic matching (ANSI/AIM standard)."""
     name = name.upper()
@@ -81,6 +140,7 @@ def soundex(name: str) -> str:
     coded = coded[:4].ljust(4, '0')
     return coded
 
+@lru_cache(maxsize=_CACHE_SIZE)
 def detect_entity_type(name: str) -> str:
     """Detect the type of entity based on name patterns."""
     name_upper = name.upper()
@@ -93,11 +153,21 @@ def detect_entity_type(name: str) -> str:
     return 'OTHER'
 
 def generate_ngrams(text: str, n: int = 3) -> set:
-    """Generate character n-grams for blocking."""
+    """Generate character n-grams for blocking.
+
+    Returns a fresh ``set`` so callers can safely mutate the result. For
+    cacheable reuse use :func:`generate_ngrams_frozen`.
+    """
+    return set(generate_ngrams_frozen(text, n))
+
+
+@lru_cache(maxsize=_CACHE_SIZE)
+def generate_ngrams_frozen(text: str, n: int = 3) -> frozenset:
+    """Cached character-n-gram generator returning an immutable frozenset."""
     text = text.lower().replace(' ', '')
     if len(text) < n:
-        return {text}
-    return {text[i:i + n] for i in range(len(text) - n + 1)}
+        return frozenset({text})
+    return frozenset(text[i:i + n] for i in range(len(text) - n + 1))
 
 def ngram_similarity(text1: str, text2: str, n: int = 3) -> float:
     """Jaccard similarity of n-grams (unweighted baseline)."""
@@ -111,6 +181,45 @@ def ngram_similarity(text1: str, text2: str, n: int = 3) -> float:
     union = len(ngrams1 | ngrams2)
     
     return intersection / union if union > 0 else 0.0
+
+
+def build_tfidf_vec(
+    text: str,
+    idf_weights: Dict[str, float],
+    n: int = 3,
+) -> Tuple[Dict[str, float], float]:
+    """Build a sparse TF-IDF vector and its L2 norm for a single string.
+
+    Used as a one-shot pre-compute so per-candidate scoring avoids re-tokenising
+    the query. Returns ``({ngram: weight}, l2_norm)``.
+    """
+    ng = generate_ngrams_frozen(text, n)
+    if not ng:
+        return {}, 0.0
+    tf = 1.0 / len(ng)
+    vec = {g: tf * idf_weights.get(g, 1.0) for g in ng}
+    norm = math.sqrt(sum(v * v for v in vec.values()))
+    return vec, norm
+
+
+def tfidf_cosine_precomputed(
+    query_vec: Dict[str, float],
+    query_norm: float,
+    cand_vec: Dict[str, float],
+    cand_norm: float,
+) -> float:
+    """Cosine similarity from two pre-built TF-IDF sparse vectors."""
+    if query_norm == 0.0 or cand_norm == 0.0:
+        return 0.0
+    if len(query_vec) > len(cand_vec):
+        query_vec, cand_vec = cand_vec, query_vec
+    dot = 0.0
+    cand_get = cand_vec.get
+    for k, v in query_vec.items():
+        cv = cand_get(k)
+        if cv is not None:
+            dot += v * cv
+    return dot / (query_norm * cand_norm)
 
 
 def tfidf_ngram_similarity(
@@ -160,12 +269,11 @@ def tfidf_ngram_similarity(
         return 0.0
     return dot / (n1 * n2)
 
+@lru_cache(maxsize=_CACHE_SIZE)
 def extract_acronym(name: str) -> str:
     """Extract potential acronym from name."""
     words = name.upper().split()
-    skip_words = {'THE', 'OF', 'AND', 'A', 'AN', 'IN', 'FOR', 'TO', 'BY'}
-    meaningful_words = [w for w in words if w not in skip_words]
-    return ''.join(w[0] for w in meaningful_words if w)
+    return ''.join(w[0] for w in words if w and w not in ACRONYM_SKIP_WORDS)
 
 def is_acronym_match(short_name: str, long_name: str) -> bool:
     """Check if short_name could be an acronym of long_name."""
@@ -175,6 +283,56 @@ def is_acronym_match(short_name: str, long_name: str) -> bool:
     if len(short) <= 5 and len(short) >= 2:
         return short == acronym or short in acronym or acronym.startswith(short)
     return False
+
+def compute_match_score_fast(
+        name1: str,
+        name2: str,
+        embedding_sim: float,
+        *,
+        soundex1: str,
+        soundex2: str,
+        query_tfidf_vec: Dict[str, float],
+        query_tfidf_norm: float,
+        cand_tfidf_vec: Dict[str, float],
+        cand_tfidf_norm: float,
+        phonetic_weight: float = 0.1,
+        ngram_weight: float = 0.15,
+        fuzzy_weight: float = 0.25,
+        embed_weight: float = 0.4,
+        acronym_weight: float = 0.1,
+) -> float:
+    """Fast multi-signal score using fully pre-computed signals.
+
+    Avoids re-running soundex / generating n-grams in the hot loop. Returns
+    only the total score; callers needing the breakdown should use
+    :func:`compute_match_score`.
+    """
+    phonetic_score = 1.0 if soundex1 == soundex2 else 0.0
+    ngram_score = tfidf_cosine_precomputed(
+        query_tfidf_vec, query_tfidf_norm, cand_tfidf_vec, cand_tfidf_norm
+    )
+
+    # rapidfuzz scorers are C-implemented and individually cheap; keep all four
+    # to preserve scoring behaviour from compute_match_score.
+    fuzzy_score = max(
+        fuzz.ratio(name1, name2),
+        fuzz.partial_ratio(name1, name2),
+        fuzz.token_sort_ratio(name1, name2),
+        fuzz.token_set_ratio(name1, name2),
+    ) / 100.0
+
+    acronym_score = 1.0 if (
+        is_acronym_match(name1, name2) or is_acronym_match(name2, name1)
+    ) else 0.0
+
+    return (
+        phonetic_weight * phonetic_score
+        + ngram_weight * ngram_score
+        + fuzzy_weight * fuzzy_score
+        + embed_weight * embedding_sim
+        + acronym_weight * acronym_score
+    )
+
 
 def compute_match_score(
         name1: str,
@@ -230,71 +388,84 @@ def compute_match_score(
     
     return total_score, breakdown
 
+@lru_cache(maxsize=_CACHE_SIZE)
+def _get_meaningful_words_frozen(name: str) -> frozenset:
+    """Cached implementation returning an immutable frozenset.
+
+    Hot-path callers can use this directly; ``get_meaningful_words`` returns
+    a fresh mutable ``set`` for backward-compat.
+    """
+    word_list = name.lower().split()
+
+    # Remove entity type words (always)
+    words_without_entity_types = [
+        w for w in word_list if w not in ENTITY_TYPE_WORDS and len(w) > 1
+    ]
+
+    # Check if there are meaningful words after removing BOTH tiers
+    truly_meaningful = [
+        w for w in word_list if w not in ALL_GENERIC and len(w) > 1
+    ]
+
+    if truly_meaningful:
+        return frozenset(truly_meaningful)
+
+    if words_without_entity_types:
+        return frozenset(words_without_entity_types)
+
+    return frozenset()
+
+
 def get_meaningful_words(name: str) -> set:
     """
     Extract meaningful distinguishing words from a name.
-    
+
     Two-tier exclusion system:
     1. Entity type suffixes (BANK, CORP, INC) - ALWAYS excluded
     2. Generic prefixes (FIRST, AMERICAN) - excluded only if meaningful words exist
-    
+
     Examples:
     - "STEARNS BANK" -> {'stearns'}
-    - "AMERICAN HERITAGE BANK" -> {'heritage'} (american/bank excluded, heritage kept)
-    - "US BANK" -> {'us'} (bank always excluded, us kept as fallback)
-    - "FIRST BANK" -> {'first'} (bank always excluded, first kept as fallback)
-    - "FIRST CHOICE BANK" -> {'choice'} (bank excluded, first excluded, choice kept)
-    - "FIRST AMERICAN BANK" -> {'first', 'american'} (bank excluded, both kept as fallback)
+    - "AMERICAN HERITAGE BANK" -> {'heritage'}
+    - "US BANK" -> {'us'} (bank excluded, us kept as fallback)
+    - "FIRST BANK" -> {'first'} (both excluded but kept as fallback)
+    - "FIRST CHOICE BANK" -> {'choice'}
+    - "FIRST AMERICAN BANK" -> {'first', 'american'} (fallback)
     """
-    # Tier 1: Entity type words - ALWAYS excluded (never meaningful)
-    entity_type_words = {
-        'bank', 'banking', 'trust', 'savings', 'credit', 'union',
-        'company', 'corporation', 'corp', 'inc', 'llc', 'ltd', 'limited',
-        'the', 'of', 'and', 'a', 'an',
-        'financial', 'services', 'group', 'holdings', 'capital', 'partners',
-        'investment', 'investments', 'management', 'fund', 'funds',
-        'advisory', 'advisors', 'asset', 'assets', 'lending', 'loan',
-        'equipment', 'finance', 'mortgage', 'solutions', 'associates',
-        'na', 'n.a.', 'fsb', 'ssb',
-    }
-    
-    # Tier 2: Generic prefixes - excluded only if there are other meaningful words
-    generic_prefixes = {
-        'american', 'united', 'us', 'usa', 'new', 'old', 'central',
-        'western', 'eastern', 'northern', 'southern', 'north', 'south',
-        'east', 'west', 'pacific', 'atlantic', 'continental', 'general',
-        'royal', 'premier', 'global', 'international', 'universal',
-        'great', 'greater', 'community', 'regional', 'state', 'metro',
-        'metropolitan', 'citizens', 'peoples', 'security', 'commerce',
-        'first', 'second', 'third', 'national', 'federal',
-    }
-    
-    word_list = name.lower().split()
-    
-    # Remove entity type words (always)
-    words_without_entity_types = [w for w in word_list if w not in entity_type_words and len(w) > 1]
-    
-    # Check if there are meaningful words after removing BOTH tiers
-    all_generic = entity_type_words | generic_prefixes
-    truly_meaningful = [w for w in word_list if w not in all_generic and len(w) > 1]
-    
-    if truly_meaningful:
-        # We have truly unique words - return only those
-        return set(truly_meaningful)
-    
-    # No truly unique words - return the non-entity-type words (which are the generic prefixes)
-    # These become meaningful by default (e.g., "FIRST AMERICAN BANK" -> {'first', 'american'})
-    if words_without_entity_types:
-        return set(words_without_entity_types)
-    
-    return set()
+    return set(_get_meaningful_words_frozen(name))
 
+@lru_cache(maxsize=_CACHE_SIZE)
+def get_primary_identifier(name_upper: str) -> Optional[str]:
+    """Return the first meaningful identifier word in an upper-cased name.
+
+    Cached on the upper-cased input. The caller is responsible for passing
+    ``name.upper().strip()``.
+    """
+    words = name_upper.split()
+    if not words:
+        return None
+
+    # Find first meaningful word
+    for word in words:
+        if word not in ALL_GENERIC_UPPER and len(word) > 2:
+            return word
+
+    # No meaningful word - return first non-article word
+    for word in words:
+        if word not in {'THE', 'A', 'AN'} and len(word) > 2:
+            return word
+    return None
+
+
+@lru_cache(maxsize=_CACHE_SIZE)
 def combined_fuzzy_score(name1: str, name2: str) -> float:
     """
     Compute weighted ensemble of fuzzy scores with safeguards against
     common-word-only matches (e.g. "Heritage Bank" matching "Old National Bank").
+
+    Cached on (name1, name2) - heavy dedup is expected on UCC data.
     """
-    
+
     ratio = fuzz.ratio(name1, name2)
     partial = fuzz.partial_ratio(name1, name2)
     token_sort = fuzz.token_sort_ratio(name1, name2)
@@ -305,63 +476,19 @@ def combined_fuzzy_score(name1: str, name2: str) -> float:
     score = 0.3 * ratio + 0.1 * partial + 0.5 * token_sort + 0.1 * token_set
 
     # GUARDRAIL 1: Meaningful Word Overlap
-    # If strings have meaningful words but share NONE, this is almost certainly wrong
-    words1 = get_meaningful_words(name1)
-    words2 = get_meaningful_words(name2)
-    
+    words1 = _get_meaningful_words_frozen(name1)
+    words2 = _get_meaningful_words_frozen(name2)
+
     if words1 and words2 and not (words1 & words2):
-        # No shared meaningful words (e.g. "AMERICAN MONTANA" vs "AMERICAN")
-        # This is a FALSE POSITIVE - crush it
         score *= 0.1  # Severe penalty - almost certain false positive
     elif words1 and words2:
-        # Calculate overlap ratio for partial penalty
         overlap_ratio = len(words1 & words2) / len(words1 | words2)
-        if overlap_ratio < 0.3:  # Less than 30% meaningful word overlap
-            score *= 0.5  # Moderate penalty
+        if overlap_ratio < 0.3:
+            score *= 0.5
 
-    # ENHANCED GUARDRAIL 2: Entity Name Mismatch Detection
-    # Special handling for bank names, company names, etc.
+    # GUARDRAIL 2: Entity Name Mismatch Detection
     name1_clean = name1.upper().strip()
     name2_clean = name2.upper().strip()
-
-    # Extract primary entity identifiers
-    # Strategy: Skip common prefixes ONLY if there's a meaningful word after
-    def get_primary_identifier(name):
-        words = name.split()
-        if not words:
-            return None
-            
-        # Common prefixes we'd like to skip IF there's something better after
-        skippable_prefixes = {
-            'THE', 'A', 'AN',
-            'AMERICAN', 'UNITED', 'US', 'USA', 'NEW', 'OLD', 'CENTRAL',
-            'WESTERN', 'EASTERN', 'NORTHERN', 'SOUTHERN', 'NORTH', 'SOUTH',
-            'EAST', 'WEST', 'PACIFIC', 'ATLANTIC', 'CONTINENTAL', 'GENERAL',
-            'ROYAL', 'PREMIER', 'GLOBAL', 'INTERNATIONAL', 'UNIVERSAL',
-            'GREAT', 'GREATER', 'COMMUNITY', 'REGIONAL', 'STATE', 'METRO',
-            'METROPOLITAN', 'CITIZENS', 'PEOPLES', 'SECURITY', 'COMMERCE',
-            'FIRST', 'SECOND', 'THIRD',
-        }
-        generic_words = {
-            'BANK', 'BANKING', 'CORP', 'CORPORATION', 'INC', 'LLC', 'LTD', 'LIMITED',
-            'COMPANY', 'CO', 'TRUST', 'FINANCIAL', 'SERVICES', 'GROUP',
-            'EQUIPMENT', 'FINANCE', 'CAPITAL', 'INVESTMENT', 'FUND',
-            'NATIONAL', 'FEDERAL', 'SAVINGS', 'CREDIT', 'UNION',
-            'LENDING', 'LOAN', 'MORTGAGE', 'HOLDINGS', 'PARTNERS',
-        }
-        all_generic = skippable_prefixes | generic_words
-
-        # Find first meaningful word
-        for word in words:
-            if word not in all_generic and len(word) > 2:
-                return word
-        
-        # No meaningful word - return first non-article word
-        for word in words:
-            if word not in {'THE', 'A', 'AN'} and len(word) > 2:
-                return word
-        return None
-
     primary1 = get_primary_identifier(name1_clean)
     primary2 = get_primary_identifier(name2_clean)
 
@@ -394,148 +521,82 @@ def combined_fuzzy_score(name1: str, name2: str) -> float:
     return score
 
 
+@lru_cache(maxsize=_CACHE_SIZE)
 def has_shared_meaningful_identifier(name1: str, name2: str) -> bool:
     """
     Check if two entity names share sufficient meaningful identifying words.
-    
+
     Logic:
     1. If words are identical, match
-    2. If one set is a subset AND the subset contains a unique identifier (not just generic), match
+    2. If one set is a subset AND the subset contains a unique identifier
+       (not just generic), match
     3. Otherwise require > 50% overlap in both directions
-    
-    A "unique identifier" is a word that's not in the generic_prefix list (truly distinguishing).
     """
-    words1 = get_meaningful_words(name1)
-    words2 = get_meaningful_words(name2)
+    words1 = _get_meaningful_words_frozen(name1)
+    words2 = _get_meaningful_words_frozen(name2)
 
-    # If EITHER name has no meaningful words, they should NOT match
     if not words1 or not words2:
         return False
 
     shared = words1 & words2
-    
-    # No shared words = definitely no match
     if not shared:
         return False
-    
-    # If identical, definitely match
+
     if words1 == words2:
         return True
-    
-    # Generic prefixes that aren't unique enough to anchor a subset match
-    generic_prefixes = {
-        'american', 'united', 'us', 'usa', 'new', 'old', 'central',
-        'western', 'eastern', 'northern', 'southern', 'north', 'south',
-        'east', 'west', 'pacific', 'atlantic', 'continental', 'general',
-        'royal', 'premier', 'global', 'international', 'universal',
-        'great', 'greater', 'community', 'regional', 'state', 'metro',
-        'metropolitan', 'citizens', 'peoples', 'security', 'commerce',
-        'first', 'second', 'third', 'national', 'federal',
-    }
-    
-    # Check if one is a subset of the other
+
     smaller, larger = (words1, words2) if len(words1) <= len(words2) else (words2, words1)
-    
-    if smaller <= larger:
-        # Subset detected - only allow if the smaller set contains a unique word
-        unique_words_in_smaller = smaller - generic_prefixes
-        if unique_words_in_smaller:
-            # Has at least one truly unique identifier - allow subset match
-            return True
-        # All words in smaller set are generic - don't allow subset match
-        # (e.g., {'first'} ⊂ {'first', 'american'} but 'first' is generic)
-    
-    # Otherwise require > 50% overlap in both directions
+    if smaller <= larger and (smaller - GENERIC_PREFIXES):
+        return True
+
     overlap1 = len(shared) / len(words1)
     overlap2 = len(shared) / len(words2)
-    
     return overlap1 > 0.5 and overlap2 > 0.5
 
-
+@lru_cache(maxsize=_CACHE_SIZE)
 def extract_entity_core(name: str) -> str:
     """
     Extract the core identifying part of an entity name.
-    
-    Strategy: Skip common prefixes ONLY if there's a meaningful word after them.
-    
+
+    Strategy: skip common prefixes only if there's a meaningful word after them.
+    Uses module-level ALL_GENERIC_UPPER for the exclusion set.
+
     Examples:
     - "STEARNS BANK EQUIPMENT FINANCE" -> "STEARNS"
-    - "AMERICAN HERITAGE NATIONAL BANK" -> "HERITAGE" (skip AMERICAN, HERITAGE is meaningful)
-    - "AMERICAN EXPRESS" -> "EXPRESS" (skip AMERICAN, EXPRESS is meaningful)
-    - "US BANK" -> "US" (keep US because BANK is generic - nothing meaningful after)
-    - "FIRST BANK" -> "FIRST" (keep FIRST because BANK is generic)
-    - "FIRST CHOICE BANK" -> "CHOICE" (skip FIRST, CHOICE is meaningful)
-    - "FIRST CITIZENS BANK" -> "FIRST" (CITIZENS is also generic, so keep FIRST)
+    - "AMERICAN HERITAGE NATIONAL BANK" -> "HERITAGE"
+    - "FIRST CHOICE BANK" -> "CHOICE"
     """
     words = name.upper().split()
     if not words:
         return name
 
-    # Common prefixes we'd like to skip IF there's something better after
-    skippable_prefixes = {
-        'THE', 'A', 'AN',
-        # Common geographic/generic prefixes
-        'AMERICAN', 'UNITED', 'US', 'USA', 'NEW', 'OLD', 'CENTRAL',
-        'WESTERN', 'EASTERN', 'NORTHERN', 'SOUTHERN', 'NORTH', 'SOUTH',
-        'EAST', 'WEST', 'PACIFIC', 'ATLANTIC', 'CONTINENTAL', 'GENERAL',
-        'ROYAL', 'PREMIER', 'GLOBAL', 'INTERNATIONAL', 'UNIVERSAL',
-        'GREAT', 'GREATER', 'COMMUNITY', 'REGIONAL', 'STATE', 'METRO',
-        'METROPOLITAN', 'CITIZENS', 'PEOPLES', 'SECURITY', 'COMMERCE',
-        'FIRST', 'SECOND', 'THIRD',
-    }
-
-    # Common suffixes that are too generic to be core identifiers
-    generic_words = {
-        'BANK', 'BANKING', 'CORP', 'CORPORATION', 'INC', 'LLC', 'LTD', 'LIMITED',
-        'COMPANY', 'CO', 'TRUST', 'FINANCIAL', 'SERVICES', 'GROUP',
-        'EQUIPMENT', 'FINANCE', 'CAPITAL', 'INVESTMENT', 'FUND',
-        'NATIONAL', 'FEDERAL', 'STATE', 'COMMUNITY', 'COMMERCIAL',
-        'SAVINGS', 'CREDIT', 'UNION', 'LENDING', 'LOAN', 'MORTGAGE',
-        'HOLDINGS', 'PARTNERS', 'ASSOCIATES', 'SOLUTIONS',
-    }
-
-    # Combine both sets for "too generic" check
-    all_generic = skippable_prefixes | generic_words
-
-    def is_meaningful(word: str) -> bool:
-        """Check if a word is meaningful (not generic) and long enough."""
-        return word not in all_generic and len(word) > 1
-
-    # Find the first meaningful word in the full name
-    first_meaningful = None
     for word in words:
-        if is_meaningful(word):
-            first_meaningful = word
-            break
+        if word not in ALL_GENERIC_UPPER and len(word) > 1:
+            return word
 
-    # If we found a meaningful word, return it
-    if first_meaningful:
-        return first_meaningful
-
-    # No meaningful word found - return first TWO non-article words as compound
-    # (e.g., "FIRST AMERICAN BANK" -> "FIRST AMERICAN", "US BANK" -> "US BANK")
     fallback_words = []
     for word in words:
         if word not in {'THE', 'A', 'AN'} and len(word) > 1:
             fallback_words.append(word)
             if len(fallback_words) >= 2:
                 break
-    
+
     if fallback_words:
         return ' '.join(fallback_words)
-    
-    return words[0] if words else name
+    return words[0]
+
+@lru_cache(maxsize=_CACHE_SIZE)
+def _long_tokens(name: str) -> frozenset:
+    """Lower-cased tokens of length > 2, cached."""
+    return frozenset(t for t in name.lower().split() if len(t) > 2)
 
 
 def min_token_overlap(name1: str, name2: str, min_overlap: int = 1) -> bool:
     """
-    Check if two names share at least min_overlap tokens.
+    Check if two names share at least ``min_overlap`` tokens (len > 2).
     Helps filter out false positives from embedding similarity.
     """
-    # Get meaningful tokens (exclude very short words)
-    tokens1 = {t for t in name1.lower().split() if len(t) > 2}
-    tokens2 = {t for t in name2.lower().split() if len(t) > 2}
-    return len(tokens1 & tokens2) >= min_overlap
+    return len(_long_tokens(name1) & _long_tokens(name2)) >= min_overlap
 
 def entity_types_compatible(type1: str, type2: str) -> bool:
     """
