@@ -17,15 +17,15 @@ class PipelineConfig(ConfigurableResource):
     
     # File paths — use absolute paths derived from project structure
     ucc_file: str = Field(
-        default=str(_PROJECT_ROOT / "Inputs" / "raw.csv"),
+        default=str(_PROJECT_ROOT / "Inputs" / "ucc.csv"),
         description="Path to UCC data file"
     )
     master_file: str = Field(
-        default=str(_PROJECT_ROOT / "Inputs" / "master_list.csv"),
+        default=str(_PROJECT_ROOT / "Inputs" / "Master Mapping.csv"),
         description="Path to master mapping file"
     )
     universe_file: str = Field(
-        default=str(_PROJECT_ROOT / "Inputs" / "tracked_banks.csv"),
+        default=str(_PROJECT_ROOT / "Inputs" / "Universe.csv"),
         description="Path to tracked banks file containing Bank Name and Firm ID"
     )
     output_dir: str = Field(

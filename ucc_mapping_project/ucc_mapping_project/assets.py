@@ -527,7 +527,7 @@ def exact_match_normalized_results(
         df.loc[no_state_pair_mask, 'confidence'] = NO_MASTER_STATE_PAIR
         context.log.info(
             f"Stage 2 - Skipped {int(no_state_pair_mask.sum()):,} records "
-            "with state pairs absent from master_list"
+            "with state pairs absent from the Master Mapping file"
         )
     
     return df
