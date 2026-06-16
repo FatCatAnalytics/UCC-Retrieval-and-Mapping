@@ -783,18 +783,22 @@ def fuzzy_match_results(
                         review_count += len(update_indices)
 
     # --- Single vectorised flush of all writes to the dataframe ---
+    # We convert numpy slices -> plain Python lists so pandas does element-wise
+    # dtype coercion (mirroring the original per-row scalar assignment).
+    # Without this, a float64 column (e.g. Firm_ID with NaN) refuses an np.int64
+    # array with a LossySetitemError on newer pandas.
     written = write_method != None  # noqa: E711 - object-dtype None compare
     if written.any():
         idx_to_write = df.index[written]
-        df.loc[idx_to_write, 'SECP_NAME_MAPPED'] = write_mapped[written]
-        df.loc[idx_to_write, 'matched_master_raw'] = write_raw[written]
-        df.loc[idx_to_write, 'Firm_ID'] = write_firm[written]
-        df.loc[idx_to_write, 'match_score'] = write_score[written]
-        df.loc[idx_to_write, 'match_method'] = write_method[written]
-        df.loc[idx_to_write, 'confidence'] = write_conf[written]
+        df.loc[idx_to_write, 'SECP_NAME_MAPPED'] = list(write_mapped[written])
+        df.loc[idx_to_write, 'matched_master_raw'] = list(write_raw[written])
+        df.loc[idx_to_write, 'Firm_ID'] = list(write_firm[written])
+        df.loc[idx_to_write, 'match_score'] = list(write_score[written])
+        df.loc[idx_to_write, 'match_method'] = list(write_method[written])
+        df.loc[idx_to_write, 'confidence'] = list(write_conf[written])
         ambig_mask = write_ambig != None  # noqa: E711
         if ambig_mask.any():
-            df.loc[df.index[ambig_mask], 'ambiguous_master_candidates'] = write_ambig[ambig_mask]
+            df.loc[df.index[ambig_mask], 'ambiguous_master_candidates'] = list(write_ambig[ambig_mask])
 
     context.log.info(
         f"Stage 3 - Fuzzy Match: {auto_count:,} auto + {review_count:,} review "
@@ -1103,14 +1107,18 @@ def advanced_embedding_results(
             context.log.info(f"    Processed {start + len(batch_queries):,} / {len(queries):,}")
 
     # Single vectorised flush
+    # Convert numpy slices -> plain Python lists so pandas does element-wise
+    # dtype coercion (mirrors original per-row scalar behaviour and avoids
+    # LossySetitemError when Firm_ID is float64 with NaN).
     if has_write.any():
         mask = has_write
-        df.loc[df_index[mask], 'SECP_NAME_MAPPED'] = write_mapped[mask]
-        df.loc[df_index[mask], 'matched_master_raw'] = write_raw[mask]
-        df.loc[df_index[mask], 'Firm_ID'] = write_firm[mask]
-        df.loc[df_index[mask], 'match_score'] = write_score[mask]
-        df.loc[df_index[mask], 'match_method'] = write_method[mask]
-        df.loc[df_index[mask], 'confidence'] = write_conf[mask]
+        idx_to_write = df_index[mask]
+        df.loc[idx_to_write, 'SECP_NAME_MAPPED'] = list(write_mapped[mask])
+        df.loc[idx_to_write, 'matched_master_raw'] = list(write_raw[mask])
+        df.loc[idx_to_write, 'Firm_ID'] = list(write_firm[mask])
+        df.loc[idx_to_write, 'match_score'] = list(write_score[mask])
+        df.loc[idx_to_write, 'match_method'] = list(write_method[mask])
+        df.loc[idx_to_write, 'confidence'] = list(write_conf[mask])
 
     context.log.info(f"Stage 4 - Advanced Match: {auto_count:,} auto, {high_count:,} high, {medium_count:,} medium")
 
