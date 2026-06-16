@@ -399,6 +399,39 @@ def master_embeddings_cache(
 
     context.log.info(f"Master embeddings cache ready: {master_embeddings.shape}")
 
+    # -------------------------------------------------------------------------
+    # Per-state-pair FAISS indices (Stage 4 perf upgrade).
+    # Each state pair gets its own IndexFlatIP over the rows in that state.
+    # Stage 4 looks up the index for the query's state pair and runs a single
+    # FAISS search instead of a per-batch np.matmul. Mathematically identical
+    # to the matmul path (both use exact inner product on normalised vectors).
+    # Skipped for tiny groups (overhead > savings).
+    # -------------------------------------------------------------------------
+    per_state_faiss: Dict[str, dict] = {}
+    if getattr(config, 'advanced_use_per_state_faiss', False):
+        min_state_size = getattr(config, 'advanced_per_state_min_size', 64)
+        state_pair_to_indices_local = normalized_master_data['state_pair_to_indices']
+        n_built = 0
+        n_rows_indexed = 0
+        for state_pair, idx_list in state_pair_to_indices_local.items():
+            if len(idx_list) < min_state_size:
+                continue  # tiny groups stay on matmul path
+            idx_arr = np.asarray(idx_list, dtype=np.int64)
+            sub_emb = np.ascontiguousarray(master_embeddings[idx_arr], dtype="float32")
+            sub_index = faiss.IndexFlatIP(sub_emb.shape[1])
+            sub_index.add(sub_emb)
+            per_state_faiss[state_pair] = {
+                'index': sub_index,
+                'master_indices': idx_arr,  # row -> global master idx
+            }
+            n_built += 1
+            n_rows_indexed += len(idx_arr)
+        context.log.info(
+            f"  Built {n_built:,} per-state FAISS indices covering "
+            f"{n_rows_indexed:,}/{len(master_normalized_list):,} master rows "
+            f"(state-pairs with < {min_state_size} rows stay on matmul path)"
+        )
+
     return {
         'embeddings': master_embeddings,
         'faiss_index': faiss_index,
@@ -410,6 +443,7 @@ def master_embeddings_cache(
         'master_meaningful_words': master_meaningful_words,
         'master_entity_cores': master_entity_cores,
         'token_to_master_ids': token_to_master_ids,
+        'per_state_faiss': per_state_faiss,
         'soundex': master_soundex,
         'model': model,
     }
@@ -869,6 +903,7 @@ def advanced_embedding_results(
     tfidf_idf_weights = master_embeddings_cache.get('tfidf_idf_weights')
     master_tfidf_vecs = master_embeddings_cache.get('master_tfidf_vecs')
     master_tfidf_norms = master_embeddings_cache.get('master_tfidf_norms')
+    per_state_faiss = master_embeddings_cache.get('per_state_faiss') or {}
 
     # Fallback: model reload
     if model is None:
@@ -945,6 +980,37 @@ def advanced_embedding_results(
     write_conf = np.empty(n_rows, dtype=object)
     has_write = np.zeros(n_rows, dtype=bool)
 
+    # Sidecar table for the optional cross-encoder rerank pass.
+    # Populated only for queries that landed in REVIEW_MEDIUM; one entry per
+    # *query* (not per row) so multiple rows sharing a normalized name are
+    # reranked once.
+    rerank_ce_top_n = getattr(config, 'advanced_cross_encoder_top_n', 10)
+    review_medium_queue: list = []  # list of dicts: query_name, candidates, best_match_idx, update_indices
+
+    # -------------------------------------------------------------------------
+    # Persistent query-embedding cache (across-run warm-restart optimisation).
+    # Encoding queries on CPU is the most expensive single step in Stage 4.
+    # If we've already encoded a query under the same model id we reload its
+    # vector from disk instead of re-running the transformer.
+    # -------------------------------------------------------------------------
+    embed_cache_obj = None
+    if getattr(config, 'query_embed_cache_enabled', False):
+        try:
+            from .embedding_cache import QueryEmbeddingCache
+            embed_dim = int(master_embeddings.shape[1])
+            embed_cache_obj = QueryEmbeddingCache(
+                cache_dir=config.query_embed_cache_path,
+                model_id=str(config.embedding_model),
+                dim=embed_dim,
+            )
+            context.log.info(
+                f"Query embedding cache: {len(embed_cache_obj):,} entries loaded "
+                f"from {config.query_embed_cache_path}"
+            )
+        except Exception as e:
+            context.log.warning(f"Query embedding cache disabled (load failed): {e!r}")
+            embed_cache_obj = None
+
     # Process in batches for CPU efficiency
     for start in range(0, len(queries), batch_size):
         end = min(start + batch_size, len(queries))
@@ -954,15 +1020,56 @@ def advanced_embedding_results(
         batch_metadata = query_metadata[start:end]
         batch_state_pairs = query_state_pairs[start:end]
 
-        # Encode batch (CPU optimized)
-        query_embeddings = model.encode(
-            batch_queries,
-            batch_size=128,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-            device='cpu'
-        )
-        query_embeddings = np.ascontiguousarray(query_embeddings, dtype="float32")
+        # ----- Encode batch (cache-aware) -----
+        # Try to satisfy from the persistent cache first; encode only the misses.
+        # Result is the same float32 (n, dim) array as before; order matches
+        # batch_queries.
+        if embed_cache_obj is not None:
+            n_batch = len(batch_queries)
+            embed_dim = int(master_embeddings.shape[1])
+            query_embeddings = np.empty((n_batch, embed_dim), dtype=np.float32)
+            miss_positions: list = []
+            miss_queries: list = []
+            for pos, q in enumerate(batch_queries):
+                cached = embed_cache_obj.get(q)
+                if cached is not None:
+                    query_embeddings[pos] = cached
+                else:
+                    miss_positions.append(pos)
+                    miss_queries.append(q)
+
+            if miss_queries:
+                # Dedup misses so we don't re-encode duplicates within a batch.
+                unique_miss_queries: list = []
+                seen: set = set()
+                for q in miss_queries:
+                    if q not in seen:
+                        seen.add(q)
+                        unique_miss_queries.append(q)
+                miss_embeds = model.encode(
+                    unique_miss_queries,
+                    batch_size=128,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                    device='cpu',
+                )
+                miss_embeds = np.ascontiguousarray(miss_embeds, dtype="float32")
+                q_to_emb = {q: miss_embeds[i] for i, q in enumerate(unique_miss_queries)}
+                for pos, q in zip(miss_positions, miss_queries):
+                    query_embeddings[pos] = q_to_emb[q]
+                try:
+                    embed_cache_obj.add_many(unique_miss_queries, miss_embeds)
+                except Exception as e:
+                    context.log.warning(f"Embedding cache write failed: {e!r}")
+        else:
+            query_embeddings = model.encode(
+                batch_queries,
+                batch_size=128,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+                device='cpu'
+            )
+            query_embeddings = np.ascontiguousarray(query_embeddings, dtype="float32")
 
         positions_by_state_pair = {}
         for pos, state_pair in enumerate(batch_state_pairs):
@@ -974,10 +1081,30 @@ def advanced_embedding_results(
                 continue
 
             candidate_array = np.asarray(candidate_indices, dtype=np.int64)
-            candidate_embeddings = master_embeddings[candidate_array]
             state_query_embeddings = query_embeddings[positions]
-            similarity_matrix = np.matmul(state_query_embeddings, candidate_embeddings.T)
             group_top_k = min(top_k, len(candidate_array))
+
+            # Candidate retrieval: per-state FAISS if available (skip matmul),
+            # otherwise fall back to the original matmul path. Both paths produce
+            # mathematically identical scores (exact inner product on L2-
+            # normalised vectors).
+            state_index_info = per_state_faiss.get(state_pair)
+            if state_index_info is not None:
+                sub_index = state_index_info['index']
+                # FAISS returns (similarities desc, sub-index ids) -- the same
+                # top_local + sims[top_local] we need below.
+                _D, _I = sub_index.search(
+                    np.ascontiguousarray(state_query_embeddings, dtype="float32"),
+                    group_top_k,
+                )
+                faiss_top_local_per_row = _I    # (n_positions, group_top_k)
+                faiss_top_sims_per_row = _D     # (n_positions, group_top_k)
+                similarity_matrix = None
+            else:
+                candidate_embeddings = master_embeddings[candidate_array]
+                similarity_matrix = np.matmul(state_query_embeddings, candidate_embeddings.T)
+                faiss_top_local_per_row = None
+                faiss_top_sims_per_row = None
 
             for row_pos, pos in enumerate(positions):
                 query_name = batch_queries[pos]
@@ -989,12 +1116,23 @@ def advanced_embedding_results(
                 q_tfidf_vec = metadata['tfidf_vec']
                 q_tfidf_norm = metadata['tfidf_norm']
 
-                sims = similarity_matrix[row_pos]
-                if len(candidate_array) > group_top_k:
-                    top_local = np.argpartition(sims, -group_top_k)[-group_top_k:]
-                    top_local = top_local[np.argsort(sims[top_local])[::-1]]
+                if faiss_top_local_per_row is not None:
+                    # FAISS path: top-K is already sorted desc by similarity.
+                    # -1 sentinels appear when the sub-index has fewer than
+                    # group_top_k items; filter them out.
+                    raw_top = faiss_top_local_per_row[row_pos]
+                    raw_sims = faiss_top_sims_per_row[row_pos]
+                    valid = raw_top >= 0
+                    top_local = raw_top[valid].astype(np.int64, copy=False)
+                    top_sims = raw_sims[valid].astype(np.float64, copy=False)
                 else:
-                    top_local = np.argsort(sims)[::-1]
+                    sims = similarity_matrix[row_pos]
+                    if len(candidate_array) > group_top_k:
+                        top_local = np.argpartition(sims, -group_top_k)[-group_top_k:]
+                        top_local = top_local[np.argsort(sims[top_local])[::-1]]
+                    else:
+                        top_local = np.argsort(sims)[::-1]
+                    top_sims = sims[top_local]
 
                 top_embed_candidates = candidate_array[top_local].tolist()
                 state_candidates = set(candidate_indices)
@@ -1004,9 +1142,10 @@ def advanced_embedding_results(
                     ngram_only = list((ngram_candidates & state_candidates) - set(top_embed_candidates))[:remaining_slots]
                     all_candidates = set(top_embed_candidates + ngram_only)
 
+                # embed_sim_map is identical in both paths: cand_idx -> sim score.
                 embed_sim_map = {
-                    int(candidate_array[local_idx]): float(sims[local_idx])
-                    for local_idx in top_local
+                    int(candidate_array[local_idx]): float(top_sims[j])
+                    for j, local_idx in enumerate(top_local)
                 }
                 for cand_idx in all_candidates:
                     if cand_idx not in embed_sim_map:
@@ -1093,6 +1232,21 @@ def advanced_embedding_results(
                     else:
                         conf_val = 'REVIEW_MEDIUM'
                         medium_count += len(update_indices)
+                        # Capture top candidates for the cross-encoder pass.
+                        # Take the top-N by embed_sim so the reranker sees the
+                        # most plausible alternatives, not just the chosen one.
+                        top_for_rerank = sorted(
+                            all_candidates,
+                            key=lambda x: embed_sim_map.get(x, 0.0),
+                            reverse=True,
+                        )[:rerank_ce_top_n]
+                        review_medium_queue.append({
+                            'query_name': query_name,
+                            'candidates': top_for_rerank,
+                            'chosen_idx': best_match_idx,
+                            'chosen_score': best_score,
+                            'update_indices': list(update_indices),
+                        })
 
                     for orig_idx in update_indices:
                         p = df_pos_lookup[orig_idx]
@@ -1108,6 +1262,129 @@ def advanced_embedding_results(
         if start > 0 and start % 5000 == 0:
             gc.collect()
             context.log.info(f"    Processed {start + len(batch_queries):,} / {len(queries):,}")
+
+    # -------------------------------------------------------------------------
+    # Cross-encoder rerank pass for REVIEW_MEDIUM rows.
+    # Never demotes: only promotes to REVIEW_HIGH or AUTO when the cross-
+    # encoder is strongly confident. If a different candidate beats the
+    # original pick by a wide margin AND clears the promote-to-high threshold,
+    # we swap to that candidate -- strictly an improvement since we're moving
+    # from a low-confidence match to a high-confidence one.
+    # -------------------------------------------------------------------------
+    if (getattr(config, 'advanced_cross_encoder_enabled', False)
+            and review_medium_queue):
+        from .cross_encoder_rerank import (
+            try_load_reranker, score_pairs, promote_confidence,
+        )
+        ce_model_name = getattr(
+            config, 'advanced_cross_encoder_model',
+            'cross-encoder/ms-marco-MiniLM-L-6-v2',
+        )
+        promote_auto = getattr(config, 'advanced_cross_encoder_promote_to_auto', 0.92)
+        promote_high = getattr(config, 'advanced_cross_encoder_promote_to_high', 0.80)
+
+        context.log.info(
+            f"Cross-encoder rerank: loading {ce_model_name} for "
+            f"{len(review_medium_queue):,} REVIEW_MEDIUM queries..."
+        )
+        ce_model = try_load_reranker(ce_model_name)
+        if ce_model is None:
+            context.log.warning(
+                "Cross-encoder rerank skipped: model failed to load (likely "
+                "not available locally and no internet). Downstream behaviour "
+                "is unchanged."
+            )
+        else:
+            # Build flat pairs list with index back-pointers.
+            pairs: list = []
+            pair_owners: list = []  # (queue_idx, cand_idx)
+            for q_idx, entry in enumerate(review_medium_queue):
+                qn = entry['query_name']
+                for cand_idx in entry['candidates']:
+                    pairs.append([qn, master_normalized_list[cand_idx]])
+                    pair_owners.append((q_idx, cand_idx))
+
+            ce_scores = score_pairs(ce_model, pairs)
+            if len(ce_scores) != len(pairs):
+                context.log.warning(
+                    "Cross-encoder returned unexpected number of scores; "
+                    "skipping rerank."
+                )
+            else:
+                # Group scores by query.
+                per_query_scores: dict = {}
+                for (q_idx, cand_idx), score in zip(pair_owners, ce_scores):
+                    per_query_scores.setdefault(q_idx, {})[cand_idx] = score
+
+                promoted_auto = promoted_high = swapped = 0
+                for q_idx, entry in enumerate(review_medium_queue):
+                    cand_scores = per_query_scores.get(q_idx, {})
+                    if not cand_scores:
+                        continue
+                    chosen_idx = entry['chosen_idx']
+                    chosen_score = cand_scores.get(chosen_idx, 0.0)
+
+                    ce_best_idx, ce_best_score = max(
+                        cand_scores.items(), key=lambda kv: kv[1]
+                    )
+
+                    # Only swap if CE prefers a different candidate by a wide
+                    # margin AND that candidate clears the promote-to-high bar.
+                    use_idx = chosen_idx
+                    use_ce_score = chosen_score
+                    if (ce_best_idx != chosen_idx
+                            and ce_best_score >= promote_high
+                            and ce_best_score > chosen_score + 0.10):
+                        use_idx = ce_best_idx
+                        use_ce_score = ce_best_score
+                        swapped += 1
+
+                    new_band = promote_confidence(
+                        'REVIEW_MEDIUM', use_ce_score, promote_auto, promote_high
+                    )
+                    if new_band is None and use_idx == chosen_idx:
+                        continue  # leave row alone
+
+                    mapped_val = master_mapped_list[use_idx]
+                    raw_val = master_raw_list[use_idx]
+                    firm_val = master_firm_id_list[use_idx]
+                    new_score = entry['chosen_score'] if use_idx == chosen_idx else max(
+                        entry['chosen_score'], use_ce_score
+                    )
+                    new_method = 'Advanced Match (Cross-Encoder Rerank)'
+                    final_band = new_band or 'REVIEW_MEDIUM'
+                    if final_band == 'AUTO':
+                        promoted_auto += len(entry['update_indices'])
+                    elif final_band == 'REVIEW_HIGH':
+                        promoted_high += len(entry['update_indices'])
+
+                    for orig_idx in entry['update_indices']:
+                        p = df_pos_lookup[orig_idx]
+                        write_mapped[p] = mapped_val
+                        write_raw[p] = raw_val
+                        write_firm[p] = firm_val
+                        write_score[p] = new_score
+                        write_method[p] = new_method
+                        write_conf[p] = final_band
+
+                # Reconcile reporting counters.
+                medium_count -= (promoted_auto + promoted_high)
+                auto_count += promoted_auto
+                high_count += promoted_high
+                context.log.info(
+                    f"Cross-encoder rerank: promoted {promoted_auto:,} -> AUTO, "
+                    f"{promoted_high:,} -> REVIEW_HIGH, swapped {swapped:,} picks"
+                )
+
+    # Persist the query embedding cache (best-effort).
+    if embed_cache_obj is not None:
+        try:
+            embed_cache_obj.save()
+            context.log.info(
+                f"Query embedding cache: persisted ({len(embed_cache_obj):,} total entries)"
+            )
+        except Exception as e:
+            context.log.warning(f"Embedding cache save failed: {e!r}")
 
     # Single vectorised flush
     # Convert numpy slices -> plain Python lists so pandas does element-wise
