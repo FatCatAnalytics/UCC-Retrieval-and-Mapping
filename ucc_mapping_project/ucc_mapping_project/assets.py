@@ -1970,23 +1970,34 @@ def lead_bank_designation(
 ) -> Output[pd.DataFrame]:
     """Per-company / per-bank filing counts plus lead-bank designation.
 
+    SCOPE: In-universe banks only.
+    --------------------------------
+    Only filings where the secured party was resolved to a Firm_ID (i.e. the
+    bank is in ``Universe.csv``) are counted. Non-universe banks are dropped
+    entirely — both from the share denominator and from the output rows —
+    because the lead-bank designation is about how *tracked* banks rank
+    against each other for a debtor, not about absolute market share.
+
     Logic
     -----
-    For each company (grouped by the debtor name found in the raw CSV plus
-    DEBT_STATE), we:
+    For each debtor / company (grouped by debtor name + DEBT_STATE), among
+    the IN-UNIVERSE banks:
 
       1. Count ORIGINAL filings and CONTINUATION filings per bank
          (bank = ``SECP_NAME_MAPPED``, falling back to ``SECP_NAME`` when
          unmapped).
       2. Compute total filings (originals + continuations + other) per bank.
-      3. Compute share = bank_total / company_total.
+      3. Compute share = bank_total / company_total_filings, where the
+         company total is the sum of all IN-UNIVERSE filings for that debtor.
       4. Designate ``is_lead_bank = True`` when:
-           * the company has exactly one bank AND that bank has >= 2 filings
-             (sole bank with sustained relationship), OR
-           * the company has multiple banks AND this bank has the strictly
-             highest total AND ``share >= threshold`` (default 0.66).
-         A company with a single bank and a single filing is NOT designated
-         (insufficient evidence, per design discussion).
+           * the company has exactly one in-universe bank AND that bank has
+             >= 2 filings (sole bank with sustained relationship), OR
+           * the company has multiple in-universe banks AND this bank has
+             the strictly highest total AND ``share >= threshold``
+             (default 0.66).
+         A company with a single in-universe bank and a single filing is
+         NOT designated (insufficient evidence, per design discussion).
+         A company with NO in-universe banks does not appear in the output.
 
     Outputs two CSVs to ``config.output_dir``:
       * ``bank_filing_counts_{ts}.csv`` -- one row per (company, bank).
@@ -2134,9 +2145,37 @@ def lead_bank_designation(
     joined["_company_display"] = debtor_name_clean
 
     # Drop rows where we have no usable bank label at all.
-    usable = joined["_bank_name"].notna() & (joined["_bank_name"].astype("string").str.strip() != "")
+    has_bank_name = (
+        joined["_bank_name"].notna()
+        & (joined["_bank_name"].astype("string").str.strip() != "")
+    )
+
+    # Restrict to IN-UNIVERSE banks only. Per the user's scoping decision
+    # (2026-06-16): non-Universe banks (no Firm_ID resolved) are excluded
+    # entirely — both from the share denominator and from the output rows.
+    # The lead-bank designation is therefore computed against the in-universe
+    # subset only, so e.g. a debtor with 1 in-universe bank + 50 non-universe
+    # filings will have that in-universe bank designated lead if it has >=2
+    # filings (sole-in-universe-bank rule), because we only care about how
+    # tracked banks rank against each other.
+    has_firm_id = joined["_bank_firm_id"].notna()
+    n_total_with_bank = int(has_bank_name.sum())
+    n_in_universe = int((has_bank_name & has_firm_id).sum())
+    if n_total_with_bank:
+        context.log.info(
+            f"lead_bank_designation: restricting to in-universe banks: "
+            f"{n_in_universe:,}/{n_total_with_bank:,} filings retained "
+            f"({n_in_universe / n_total_with_bank:.1%}); "
+            f"{n_total_with_bank - n_in_universe:,} filings dropped because "
+            "the secured party has no Firm_ID (bank not in Universe.csv)."
+        )
+    usable = has_bank_name & has_firm_id
     if not usable.any():
-        context.log.warning("lead_bank_designation: no rows have a bank label; producing empty output.")
+        context.log.warning(
+            "lead_bank_designation: no in-universe banks found in any filing; "
+            "producing empty output. Check that Universe.csv contains the "
+            "banks you expect, and that the matching pipeline resolved them."
+        )
         empty = pd.DataFrame(
             columns=[
                 "Firm_ID", "company_name", "company_state",
