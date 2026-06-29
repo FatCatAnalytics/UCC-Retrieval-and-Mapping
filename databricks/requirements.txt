@@ -1,0 +1,5 @@
+# Non-default Python deps for the UCC mapping pipeline on Databricks.
+# Databricks Runtime (ML) already ships pandas + numpy + pyspark.
+rapidfuzz>=3.0
+sentence-transformers>=2.2
+faiss-cpu>=1.7
