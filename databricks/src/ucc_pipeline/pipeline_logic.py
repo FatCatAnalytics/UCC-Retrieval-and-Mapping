@@ -280,7 +280,7 @@ def master_embeddings_cache(
         normalized_master_data: dict,
 ) -> dict:
     """Pre-compute master embeddings (CPU OPTIMIZED)."""
-    from sentence_transformers import SentenceTransformer
+    from .embeddings import load_embedding_model
     import faiss
     import os
     from concurrent.futures import ThreadPoolExecutor
@@ -297,11 +297,8 @@ def master_embeddings_cache(
         context.log.info("No master data to embed")
         return {'embeddings': None, 'faiss_index': None, 'ngram_index': None}
 
-    context.log.info("Loading embedding model for CPU...")
-    try:
-        model = SentenceTransformer(config.embedding_model, device='cpu')
-    except Exception:
-        model = SentenceTransformer('BAAI/bge-small-en-v1.5', device='cpu')
+    context.log.info("Loading embedding model...")
+    model = load_embedding_model(config, context)
 
     # CPU-optimized encoding
     context.log.info(f"Encoding {len(master_normalized_list):,} master mappings (CPU)...")
@@ -908,12 +905,9 @@ def advanced_embedding_results(
 
     # Fallback: model reload
     if model is None:
-        from sentence_transformers import SentenceTransformer
+        from .embeddings import load_embedding_model
         context.log.warning("Model not found in cache, reloading...")
-        try:
-            model = SentenceTransformer(config.embedding_model, device='cpu')
-        except Exception:
-            model = SentenceTransformer('BAAI/bge-small-en-v1.5', device='cpu')
+        model = load_embedding_model(config, context)
 
     if master_embeddings is None:
         context.log.error("Critical: Master embeddings cache is invalid!")
@@ -1001,7 +995,7 @@ def advanced_embedding_results(
             embed_dim = int(master_embeddings.shape[1])
             embed_cache_obj = QueryEmbeddingCache(
                 cache_dir=config.query_embed_cache_path,
-                model_id=str(config.embedding_model),
+                model_id=str(getattr(model, 'model_id', config.embedding_model)),
                 dim=embed_dim,
             )
             context.log.info(
@@ -1449,14 +1443,11 @@ def clustered_results(
     # Use model from cache (no reloading)
     model = master_embeddings_cache.get('model')
     if model is None:
-        from sentence_transformers import SentenceTransformer
-        try:
-            model = SentenceTransformer(config.embedding_model, device='cpu')
-        except Exception:
-            model = SentenceTransformer('BAAI/bge-small-en-v1.5', device='cpu')
+        from .embeddings import load_embedding_model
+        model = load_embedding_model(config, context)
     else:
         context.log.info("Using model from cache (no reload)")
-    
+
     context.log.info("Encoding unmatched names...")
     embed_dim = int(getattr(model, "get_sentence_embedding_dimension", lambda: 384)() or 384)
     embeddings = np.empty((n, embed_dim), dtype="float32")
@@ -1593,14 +1584,11 @@ def merged_cluster_results(
     # Use model from cache (no reloading)
     model = master_embeddings_cache.get('model')
     if model is None:
-        from sentence_transformers import SentenceTransformer
-        try:
-            model = SentenceTransformer(config.embedding_model, device='cpu')
-        except Exception:
-            model = SentenceTransformer('BAAI/bge-small-en-v1.5', device='cpu')
+        from .embeddings import load_embedding_model
+        model = load_embedding_model(config, context)
     else:
         context.log.info("Using model from cache (no reload)")
-    
+
     n_iterations = config.cluster_merge_iterations
     merge_k = config.cluster_merge_k
     max_cluster_size = config.cluster_max_size
@@ -1812,12 +1800,9 @@ def suggested_mapping_results(
 
     # Fallback handling
     if model is None:
-        from sentence_transformers import SentenceTransformer
+        from .embeddings import load_embedding_model
         context.log.warning("Model not found in cache, reloading...")
-        try:
-            model = SentenceTransformer(config.embedding_model, device='cpu')
-        except Exception:
-            model = SentenceTransformer('BAAI/bge-small-en-v1.5', device='cpu')
+        model = load_embedding_model(config, context)
 
     if master_embeddings is None or index is None:
         import faiss

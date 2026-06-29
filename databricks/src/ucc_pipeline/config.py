@@ -9,6 +9,17 @@ On Databricks, file-path fields normally point at Unity Catalog **Volumes**
 parameters; everything else can stay on its default. Use
 ``PipelineConfig.from_overrides({...})`` to apply job parameters / widget values
 on top of the defaults.
+
+Embeddings (``embedding_backend``)
+----------------------------------
+By default the pipeline embeds text through a **Databricks Foundation Model API**
+serving endpoint (``embedding_endpoint``, default ``databricks-bge-large-en-v1.5``)
+via ``mlflow.deployments`` -- no model download, no GPU. The workspace must have
+that Foundation Model API enabled (pay-per-token). ``embedding_dim`` MUST match
+the endpoint (bge-large / gte-large = 1024; the local bge-small = 384). To run
+off-Databricks, set ``embedding_backend="local"`` to fall back to the bundled
+``sentence-transformers`` model named by ``embedding_model``. The matching /
+clustering math is unaffected -- only the source of the vectors changes.
 """
 from __future__ import annotations
 
@@ -32,7 +43,30 @@ class PipelineConfig:
     universe_file: str = f"{_DATA_ROOT}/Inputs/Universe.csv"
     output_dir: str = f"{_DATA_ROOT}/Outputs"
 
-    # --- Embedding model (local volume path or HuggingFace id) ---
+    # --- Embedding backend ---------------------------------------------------
+    # "databricks" (default): use a Databricks Foundation Model API serving
+    #   endpoint (no GPU/model download; calls mlflow.deployments). The workspace
+    #   must have the chosen endpoint enabled (pay-per-token Foundation Model
+    #   API, e.g. databricks-bge-large-en-v1.5).
+    # "local": use the original sentence-transformers model (embedding_model
+    #   below) -- for running off-Databricks (CI, laptops).
+    embedding_backend: str = "databricks"
+
+    # Databricks Foundation Model embedding endpoint + its output dimension.
+    # NOTE: embedding_dim MUST match the endpoint:
+    #   databricks-bge-large-en-v1.5 -> 1024
+    #   databricks-gte-large-en-v1.5 -> 1024
+    #   (local) BAAI/bge-small-en-v1.5 -> 384
+    embedding_endpoint: str = "databricks-bge-large-en-v1.5"
+    embedding_dim: int = 1024
+
+    # Endpoint request shaping: max texts per call (endpoints cap batch size),
+    # and exponential-backoff retry policy for rate limits / transient 5xx.
+    embedding_max_batch: int = 128
+    embedding_max_retries: int = 4
+    embedding_retry_base_delay: float = 0.5
+
+    # --- Embedding model (LOCAL backend only: local volume path / HF id) ---
     embedding_model: str = "BAAI/bge-small-en-v1.5"
 
     # --- Matching thresholds ---
@@ -87,6 +121,12 @@ class PipelineConfig:
     query_embed_cache_path: str = f"{_DATA_ROOT}/.cache/query_embeddings"
 
     # --- Cross-encoder rerank (REVIEW_MEDIUM band) ---
+    # advanced_cross_encoder_model accepts either a local cross-encoder id
+    # (sentence-transformers, the default) OR a Databricks serving endpoint name
+    # beginning with "databricks-" (e.g. a hosted reranker). When a Databricks
+    # endpoint is given it is called via mlflow.deployments; if the workspace has
+    # no reranker endpoint the loader returns None and rerank degrades to a clean
+    # no-op (Stage 4 verdicts are left unchanged), exactly as today.
     advanced_cross_encoder_enabled: bool = True
     advanced_cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     advanced_cross_encoder_top_n: int = 10

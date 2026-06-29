@@ -29,12 +29,97 @@ import math
 from typing import List, Optional, Sequence
 
 
-def try_load_reranker(model_name: str, device: str = "cpu"):
-    """Try to load the cross-encoder model. Return the model or None on failure.
+def _is_databricks_endpoint(model_name: str) -> bool:
+    """Heuristic: a Databricks serving endpoint, not a local cross-encoder id.
 
-    We import sentence_transformers lazily so that environments without it
-    don't pay the import cost.
+    Databricks Foundation Model / served endpoints are referenced by a bare
+    endpoint name (e.g. ``databricks-bge-reranker-large-v2``). Local
+    sentence-transformers ids look like ``cross-encoder/ms-marco-...``.
     """
+    if not model_name:
+        return False
+    return model_name.startswith("databricks-") or model_name.startswith("endpoints:/")
+
+
+class DatabricksReranker:
+    """Reranker backed by a Databricks serving endpoint (mlflow.deployments).
+
+    Kept behind the same ``try_load_reranker`` / ``score_pairs`` interface used by
+    Stage 4 so pipeline_logic.py is unchanged. ``score`` returns relevance in
+    [0, 1] -- one per (query, candidate) pair. Any failure returns an empty list
+    so Stage 4 treats the rerank as a no-op.
+    """
+
+    def __init__(self, endpoint: str, client=None):
+        self.endpoint = str(endpoint)
+        self._client = client
+
+    def _get_client(self):
+        if self._client is None:
+            from mlflow.deployments import get_deploy_client  # lazy import
+
+            self._client = get_deploy_client("databricks")
+        return self._client
+
+    def score(self, pairs: Sequence[Sequence[str]]) -> List[float]:
+        if not pairs:
+            return []
+        client = self._get_client()
+        queries = [p[0] for p in pairs]
+        texts = [p[1] for p in pairs]
+        try:
+            resp = client.predict_endpoint(
+                self.endpoint, {"query": queries, "text": texts}
+            )
+        except Exception:
+            # Alternative payload shape used by some reranker deployments.
+            try:
+                resp = client.predict_endpoint(
+                    self.endpoint,
+                    {"inputs": [{"query": q, "text": t} for q, t in zip(queries, texts)]},
+                )
+            except Exception:
+                return []
+        return _extract_rerank_scores(resp, len(pairs))
+
+
+def _extract_rerank_scores(resp, n: int) -> List[float]:
+    """Pull n relevance scores out of a reranker endpoint response."""
+    data = resp
+    if isinstance(resp, dict):
+        for key in ("predictions", "data", "scores", "results"):
+            if key in resp and resp[key] is not None:
+                data = resp[key]
+                break
+    try:
+        out: List[float] = []
+        for item in data:
+            if isinstance(item, dict):
+                val = item.get("score", item.get("relevance_score", item.get("value")))
+            else:
+                val = item
+            out.append(float(val))
+    except Exception:
+        return []
+    return out if len(out) == n else []
+
+
+def try_load_reranker(model_name: str, device: str = "cpu"):
+    """Try to load the reranker. Return a model handle or None on failure.
+
+    If ``model_name`` names a Databricks serving endpoint we return a
+    :class:`DatabricksReranker`; otherwise we load a local
+    ``sentence_transformers.CrossEncoder`` (imported lazily). On any failure
+    return None so Stage 4 acts as if rerank were disabled.
+    """
+    if _is_databricks_endpoint(model_name):
+        try:
+            reranker = DatabricksReranker(model_name)
+            reranker._get_client()  # fail fast if mlflow/client unavailable
+            return reranker
+        except Exception:
+            return None
+
     try:
         from sentence_transformers import CrossEncoder  # type: ignore
     except Exception:
@@ -65,6 +150,11 @@ def score_pairs(model, pairs: Sequence[Sequence[str]]) -> List[float]:
     """
     if not pairs:
         return []
+
+    # Databricks-served reranker already returns calibrated [0, 1] scores.
+    if isinstance(model, DatabricksReranker):
+        return model.score(list(pairs))
+
     try:
         # CrossEncoder.predict returns raw logits; we sigmoid for [0, 1] range.
         raw = model.predict(list(pairs), batch_size=64, show_progress_bar=False)

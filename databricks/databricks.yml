@@ -10,6 +10,13 @@
 #                                    (recommended; no intermediate serialization).
 #   * ucc_mapping_pipeline_staged  — 17 tasks, one per Dagster asset, wired with
 #                                    depends_on to reproduce the asset DAG.
+#
+# Embeddings: by default the pipeline calls a Databricks Foundation Model API
+# serving endpoint (config.embedding_endpoint, default databricks-bge-large-en-v1.5)
+# via mlflow.deployments. The workspace must have that Foundation Model API enabled
+# (pay-per-token) and the job's run identity must be permitted to query it. The
+# deploy client authenticates from the cluster context automatically — no token
+# config needed. To run without it, pass --conf embedding_backend=local. See README.
 bundle:
   name: ucc_mapping_pipeline
 
@@ -84,9 +91,15 @@ resources:
               - output_dir=${var.data_root}/Outputs
           libraries:
             - whl: ./dist/*.whl
+            # mlflow + databricks-sdk back the Foundation Model API embedding
+            # client (embedding_backend=databricks). Databricks Runtime ML
+            # already ships mlflow; pinned here for non-ML runtimes.
+            - pypi: {package: mlflow>=2.9}
+            - pypi: {package: databricks-sdk>=0.20}
             - pypi: {package: rapidfuzz>=3.0}
-            - pypi: {package: sentence-transformers>=2.2}
             - pypi: {package: faiss-cpu>=1.7}
+            # Only needed for embedding_backend=local / local cross-encoder.
+            - pypi: {package: sentence-transformers>=2.2}
 
     # ----------------------------------------------------------------------
     # Alternative: one task per asset, wired to reproduce the Dagster DAG.
@@ -125,10 +138,14 @@ resources:
               - --conf
               - output_dir=${var.data_root}/Outputs
           libraries: &stage_libs
+            # See single-task job above: mlflow/databricks-sdk back the
+            # Foundation Model API embedding client.
             - whl: ./dist/*.whl
+            - pypi: {package: mlflow>=2.9}
+            - pypi: {package: databricks-sdk>=0.20}
             - pypi: {package: rapidfuzz>=3.0}
-            - pypi: {package: sentence-transformers>=2.2}
             - pypi: {package: faiss-cpu>=1.7}
+            - pypi: {package: sentence-transformers>=2.2}
 
         - task_key: master_mapping_data
           job_cluster_key: ucc_cluster

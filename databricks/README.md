@@ -32,7 +32,7 @@ output kind), and the two CLI entrypoints execute it.
 databricks/
 ├── databricks.yml          # Asset Bundle: 2 jobs (single-task + 17-task DAG)
 ├── pyproject.toml          # builds the ucc_pipeline wheel + console entrypoints
-├── requirements.txt        # non-default deps (rapidfuzz, sentence-transformers, faiss-cpu)
+├── requirements.txt        # non-default deps (mlflow, databricks-sdk, rapidfuzz, faiss-cpu, sentence-transformers)
 └── src/ucc_pipeline/
     ├── pipeline_logic.py    # the 17 asset functions (copied from assets.py, unchanged logic)
     ├── dagster_compat.py    # Dagster shims (asset/Output/context/MetadataValue)
@@ -42,7 +42,9 @@ databricks/
     ├── cli.py               # --conf key=value parameter plumbing
     ├── run_pipeline.py      # entrypoint: run whole DAG in one process (recommended)
     ├── run_stage.py         # entrypoint: run a single stage (used by the staged job)
-    ├── constants.py, utils.py, embedding_cache.py, cross_encoder_rerank.py  # copied unchanged
+    ├── embeddings.py        # embedding backend abstraction (Databricks FMAPI / local)
+    ├── cross_encoder_rerank.py  # reranker: local cross-encoder OR Databricks endpoint
+    ├── constants.py, utils.py, embedding_cache.py  # copied unchanged
     └── models/data_structures.py                                            # copied unchanged
 ```
 
@@ -57,6 +59,57 @@ tables** (`universe_enriched_results`, `updated_master_data`,
 `merged_raw_with_firm_id`, `lead_bank_designation`). The single-task job keeps
 everything in memory and skips the pickle round-trips entirely.
 
+## Embeddings (Databricks Foundation Model API)
+
+Text is embedded through a **Databricks Foundation Model API** serving endpoint by
+default — no model download, no GPU. The backend calls
+`mlflow.deployments.get_deploy_client("databricks").predict_endpoint(endpoint, {"input": texts})`
+and returns L2-normalised `float32` vectors. The FAISS index build, cosine
+search and clustering downstream are **unchanged** — only the source of the
+vectors changed.
+
+Controlled by `config.PipelineConfig`:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `embedding_backend` | `databricks` | `databricks` (FMAPI endpoint) or `local` (sentence-transformers) |
+| `embedding_endpoint` | `databricks-bge-large-en-v1.5` | serving endpoint name |
+| `embedding_dim` | `1024` | **must match the endpoint** (see table below) |
+| `embedding_max_batch` | `128` | texts per endpoint request (endpoints cap batch size) |
+| `embedding_max_retries` | `4` | retries with exponential backoff on rate limits / 5xx |
+| `embedding_model` | `BAAI/bge-small-en-v1.5` | **local backend only**: HF id or Volume path |
+
+**Endpoint ↔ dimension (must match):**
+
+| Endpoint | `embedding_dim` |
+|---|---|
+| `databricks-bge-large-en-v1.5` (default) | `1024` |
+| `databricks-gte-large-en-v1.5` (alternative) | `1024` |
+| `BAAI/bge-small-en-v1.5` (local fallback) | `384` |
+
+Switching endpoints: `--conf embedding_endpoint=databricks-gte-large-en-v1.5`
+(leave `embedding_dim=1024`). Switching to a different-dimension model means you
+**must** also set `embedding_dim` to match, or the FAISS build / query-embedding
+cache will reject the vectors.
+
+**Prerequisites:** the workspace must have the chosen Foundation Model API
+enabled (pay-per-token) and the cluster identity must be allowed to query it.
+Databricks Runtime ML ships `mlflow`, and the deploy client authenticates from
+the cluster's notebook/job context automatically — no token plumbing needed. Off
+Databricks, install `mlflow` + `databricks-sdk` (see `requirements.txt`) and set
+`DATABRICKS_HOST` / `DATABRICKS_TOKEN`.
+
+**Fall back to local models** (CI / laptops / air-gapped): set
+`--conf embedding_backend=local` and (optionally) stage the model on a Volume:
+`--conf embedding_model=/Volumes/.../bge-small-en-v1.5 --conf embedding_dim=384`.
+
+**Cross-encoder reranker (Stage 4 REVIEW_MEDIUM):** `advanced_cross_encoder_model`
+defaults to the local `cross-encoder/ms-marco-MiniLM-L-6-v2`. Set it to a
+Databricks serving endpoint name (prefix `databricks-`, e.g. a hosted reranker)
+to rerank through `mlflow.deployments`. If the named endpoint is unavailable the
+reranker loads as `None` and Stage 4 proceeds with the rerank as a clean no-op —
+the same graceful degradation as before.
+
 ## Configuration & secrets
 
 All tuning lives in `config.PipelineConfig` (mirrors the Dagster
@@ -69,12 +122,13 @@ parameters. Environment variables (set as cluster `spark_env_vars`):
 | `UCC_STAGE_DIR` | UC Volume dir for intermediate pickles | `$UCC_DATA_ROOT/_staging` |
 | `UCC_CATALOG` / `UCC_SCHEMA` | UC target for published Delta tables | `main` / `ucc` |
 
-**Secrets:** the pipeline needs none (no DBs, no APIs, no cloud keys). The only
-network access is the optional HuggingFace model download for
-`embedding_model` (default `BAAI/bge-small-en-v1.5`) and the optional
-cross-encoder. To run fully offline, stage those models on a Volume and point
-`--conf embedding_model=/Volumes/.../bge-small-en-v1.5`. If you later add a
-secret, read it via `io_utils.get_dbutils().secrets.get(scope, key)`.
+**Secrets:** on Databricks the pipeline needs none — the Foundation Model API
+deploy client authenticates from the cluster context. The only network access is
+the embedding (and optional reranker) endpoint calls. Off Databricks, set
+`DATABRICKS_HOST`/`DATABRICKS_TOKEN` for the deploy client, or switch to
+`embedding_backend=local` (see [Embeddings](#embeddings-databricks-foundation-model-api))
+to run fully offline. If you later add a secret, read it via
+`io_utils.get_dbutils().secrets.get(scope, key)`.
 
 ## Deploy & run
 
