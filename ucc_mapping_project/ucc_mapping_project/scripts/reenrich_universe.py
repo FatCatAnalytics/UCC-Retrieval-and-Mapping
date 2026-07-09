@@ -17,7 +17,7 @@ import pandas as pd
 
 # ── paths ────────────────────────────────────────────────────────────────────
 _HERE = Path(__file__).parent.parent          # ucc_mapping_project/
-TRACKED_BANKS_FILE = _HERE / "Inputs" / "tracked_banks.csv"
+TRACKED_BANKS_FILE = _HERE / "Inputs" / "Universe.csv"
 OUTPUT_DIR    = _HERE / "Outputs"
 
 

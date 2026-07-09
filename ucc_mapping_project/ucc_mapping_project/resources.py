@@ -17,15 +17,15 @@ class PipelineConfig(ConfigurableResource):
     
     # File paths — use absolute paths derived from project structure
     ucc_file: str = Field(
-        default=str(_PROJECT_ROOT / "Inputs" / "raw.csv"),
+        default=str(_PROJECT_ROOT / "Inputs" / "ucc.csv"),
         description="Path to UCC data file"
     )
     master_file: str = Field(
-        default=str(_PROJECT_ROOT / "Inputs" / "master_list.csv"),
+        default=str(_PROJECT_ROOT / "Inputs" / "Master Mapping.csv"),
         description="Path to master mapping file"
     )
     universe_file: str = Field(
-        default=str(_PROJECT_ROOT / "Inputs" / "tracked_banks.csv"),
+        default=str(_PROJECT_ROOT / "Inputs" / "Universe.csv"),
         description="Path to tracked banks file containing Bank Name and Firm ID"
     )
     output_dir: str = Field(
@@ -71,6 +71,20 @@ class PipelineConfig(ConfigurableResource):
     # Early termination settings
     early_stop_threshold: float = Field(default=0.98, description="Stop searching after finding match this good")
     max_candidates_per_query: int = Field(default=50, description="Maximum candidates to evaluate per query")
+
+    # Lead-bank designation (Stage 8)
+    lead_bank_threshold: float = Field(
+        default=0.66,
+        description="Minimum share of total filings (originals + continuations) a single bank must hold to be designated the lead bank for a company. Default 0.66 = 66%."
+    )
+    filing_type_column: str = Field(
+        default="",
+        description="Override: name of the raw-CSV column that holds filing type (originals vs continuations). Leave blank to auto-detect from common names (FILING_TYPE, FILING_TYP, RECORD_TYPE, TYPE, FILING)."
+    )
+    debtor_company_column: str = Field(
+        default="",
+        description="Override: name of the raw-CSV column that holds the debtor / company name. Leave blank to auto-detect from common names (DEBT_NAME, DEBTOR_NAME, DEBT_FIRM, DEBTOR, COMPANY_NAME, DEBTOR_COMPANY)."
+    )
 
     # Clustering performance
     cluster_memmap_threshold_mb: int = Field(default=512, description="Use disk-backed embeddings above this size")

@@ -8,10 +8,22 @@ from ..utils import generate_ngrams
 
 
 class NGramIndex:
+    """Inverted index from character n-grams to item ids.
+
+    Build path keeps Python sets for fast insertion. After loading is done,
+    call :py:meth:`freeze` to convert posting lists to numpy ``int64`` arrays
+    and switch :py:meth:`query` to a vectorised numpy counter (orders of
+    magnitude faster than the per-id dict accumulator).
+    """
+
     def __init__(self, n: int = 3):
         self.n = n
-        self.ngram_to_ids = {}
-        self.id_to_name = {}
+        self.ngram_to_ids: dict = {}
+        self.id_to_name: dict = {}
+        self._frozen = False
+        self._max_id = -1
+        self._postings: dict = {}   # ngram -> np.ndarray[int64]
+        self._counter = None        # np.ndarray[int32]
 
     def add(self, item_id: int, text: str):
         """Add an item to the index."""
@@ -21,21 +33,69 @@ class NGramIndex:
     def add_precomputed(self, item_id: int, text: str, ngrams: set):
         """Add an item with pre-computed n-grams (for parallel processing)."""
         self.id_to_name[item_id] = text
+        if item_id > self._max_id:
+            self._max_id = item_id
         for ngram in ngrams:
-            if ngram not in self.ngram_to_ids:
-                self.ngram_to_ids[ngram] = set()
-            self.ngram_to_ids[ngram].add(item_id)
+            s = self.ngram_to_ids.get(ngram)
+            if s is None:
+                self.ngram_to_ids[ngram] = {item_id}
+            else:
+                s.add(item_id)
+        # Any new add invalidates the frozen state
+        if self._frozen:
+            self._frozen = False
+            self._postings = {}
+            self._counter = None
+
+    def freeze(self):
+        """Pre-convert posting sets to numpy arrays + allocate counter buffer.
+
+        After calling this, :py:meth:`query` runs in vectorised numpy.
+        """
+        if self._max_id < 0:
+            self._postings = {}
+            self._counter = np.empty(0, dtype=np.int32)
+            self._frozen = True
+            return
+        self._postings = {
+            ng: np.fromiter(ids, dtype=np.int64, count=len(ids))
+            for ng, ids in self.ngram_to_ids.items()
+        }
+        # Reusable counter buffer indexed by item_id
+        self._counter = np.zeros(self._max_id + 1, dtype=np.int32)
+        self._frozen = True
 
     def query(self, text: str, min_overlap: int = 1) -> List[int]:
-        """Query the index for similar items."""
+        """Query the index for similar items.
+
+        Frozen path (after :py:meth:`freeze`) uses a numpy counter and
+        ``np.add.at`` — O(total_postings) but with C-level loops.
+        """
         query_ngrams = generate_ngrams(text, self.n)
-        candidate_counts = {}
+        if not query_ngrams:
+            return []
 
+        if self._frozen and self._counter is not None:
+            counter = self._counter
+            counter.fill(0)
+            postings = self._postings
+            for ng in query_ngrams:
+                arr = postings.get(ng)
+                if arr is not None:
+                    # np.add.at handles repeats safely; postings have unique ids
+                    # within an ngram, so plain indexing suffices
+                    counter[arr] += 1
+            hits = np.flatnonzero(counter >= min_overlap)
+            return hits.tolist()
+
+        # Fallback: legacy dict-accumulator path (pre-freeze)
+        candidate_counts: Dict[int, int] = {}
         for ngram in query_ngrams:
-            if ngram in self.ngram_to_ids:
-                for item_id in self.ngram_to_ids[ngram]:
-                    candidate_counts[item_id] = candidate_counts.get(item_id, 0) + 1
-
+            ids = self.ngram_to_ids.get(ngram)
+            if ids is None:
+                continue
+            for item_id in ids:
+                candidate_counts[item_id] = candidate_counts.get(item_id, 0) + 1
         return [item_id for item_id, count in candidate_counts.items() if count >= min_overlap]
 
 
@@ -87,6 +147,28 @@ class TFIDFNGramIndex:
             # smooth IDF: log((N + 1) / (df + 1)) + 1
             self._idf[ng] = math.log((N + 1) / (df + 1)) + 1.0
         self._frozen = True
+
+    def build_vectors(self) -> Tuple[Dict[int, Dict[str, float]], Dict[int, float]]:
+        """Pre-compute per-document TF-IDF sparse vectors and their L2 norms.
+
+        Returns ``(id -> {ngram: weight}, id -> l2_norm)`` so scoring loops
+        can skip re-vectorising master strings.
+        """
+        if not self._frozen:
+            raise RuntimeError("Call freeze() before build_vectors()")
+        vecs: Dict[int, Dict[str, float]] = {}
+        norms: Dict[int, float] = {}
+        idf = self._idf
+        for item_id, ngrams in self.id_to_ngrams.items():
+            if not ngrams:
+                vecs[item_id] = {}
+                norms[item_id] = 0.0
+                continue
+            tf = 1.0 / len(ngrams)
+            v = {ng: tf * idf.get(ng, 1.0) for ng in ngrams}
+            vecs[item_id] = v
+            norms[item_id] = math.sqrt(sum(x * x for x in v.values()))
+        return vecs, norms
 
     # -- querying --------------------------------------------------------
 

@@ -46,9 +46,9 @@ ucc_mapping_project/Outputs/
 # =============================================================================
 # Input data files (large / proprietary — do not commit)
 # =============================================================================
-**/Inputs/raw.csv
-**/Inputs/tracked_banks.csv
-# Keep master_list.csv in version control (reference data)
+**/Inputs/ucc.csv
+**/Inputs/Universe.csv
+# Keep "Master Mapping.csv" in version control (reference data)
 
 # =============================================================================
 # ML models & caches (large binary files)
