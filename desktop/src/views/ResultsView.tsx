@@ -188,11 +188,14 @@ function ReviewTab({ run, client }: { run: RunSnapshot; client: EngineClient }) 
   const [edits, setEdits] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState("");
   const [msg, setMsg] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const limit = 100;
 
   useEffect(() => {
     const t = setTimeout(() => {
-      client.review(run.id, { confidence: bands, search, decision: filter, offset, limit }).then(setPage).catch(() => setPage(null));
+      client.review(run.id, { confidence: bands, search, decision: filter, offset, limit })
+        .then((p) => { setPage(p); setLoadError(null); })
+        .catch((e) => { setPage(null); setLoadError(describeError(e)); });
     }, 200);
     return () => clearTimeout(t);
   }, [client, run.id, bands, search, filter, offset, tick]);
@@ -332,7 +335,11 @@ function ReviewTab({ run, client }: { run: RunSnapshot; client: EngineClient }) 
               );
             })}
             {page && rows.length === 0 && <tr><td colSpan={6} className="muted">No rows.</td></tr>}
-            {!page && <tr><td colSpan={6} className="muted">Loading…</td></tr>}
+            {!page && (
+              <tr><td colSpan={6} className="muted">
+                {loadError ? <LoadFailed error={loadError} onRetry={refresh} /> : "Loading…"}
+              </td></tr>
+            )}
           </tbody>
         </table>
       </div>
@@ -355,14 +362,18 @@ function ClustersTab({ run, client }: { run: RunSnapshot; client: EngineClient }
   const [minSize, setMinSize] = useState(2);
   const [page, setPage] = useState<Page | null>(null);
   const [offset, setOffset] = useState(0);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [tick, setTick] = useState(0);
   const limit = 100;
 
   useEffect(() => {
     const t = setTimeout(() => {
-      client.clusters(run.id, { search, min_size: minSize, offset, limit }).then(setPage).catch(() => setPage(null));
+      client.clusters(run.id, { search, min_size: minSize, offset, limit })
+        .then((p) => { setPage(p); setLoadError(null); })
+        .catch((e) => { setPage(null); setLoadError(describeError(e)); });
     }, 200);
     return () => clearTimeout(t);
-  }, [client, run.id, search, minSize, offset]);
+  }, [client, run.id, search, minSize, offset, tick]);
 
   const cols = ["cluster_label", "cluster_size", "states", "suggested_mapping", "suggestion_score", "suggestion_confidence", "sample_names"];
   return (
@@ -375,8 +386,27 @@ function ClustersTab({ run, client }: { run: RunSnapshot; client: EngineClient }
         <input className="grow" placeholder="Search cluster label / names / suggestion…" value={search}
           onChange={(e) => { setOffset(0); setSearch(e.target.value); }} />
       </div>
-      <DataTable page={page} cols={cols} offset={offset} limit={limit} setOffset={setOffset} />
+      {loadError && !page
+        ? <p className="muted"><LoadFailed error={loadError} onRetry={() => setTick((t) => t + 1)} /></p>
+        : <DataTable page={page} cols={cols} offset={offset} limit={limit} setOffset={setOffset} />}
     </>
+  );
+}
+
+/** Human message for a failed engine call (network errors surface as a bare TypeError). */
+export function describeError(e: unknown): string {
+  const m = e instanceof Error ? e.message : String(e);
+  return /failed to fetch|load failed|networkerror|connection refused/i.test(m)
+    ? "The mapping engine is not reachable. If you started it yourself, check it is still running; otherwise restart the app."
+    : m;
+}
+
+export function LoadFailed({ error, onRetry }: { error: string; onRetry: () => void }) {
+  return (
+    <span className="load-failed">
+      <span className="warn">Could not load: {error}</span>{" "}
+      <button className="link small" onClick={onRetry}>Retry</button>
+    </span>
   );
 }
 

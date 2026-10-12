@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { EngineClient, native } from "../api";
 import type { DecisionRecord, DecisionsPage, Health, RunSnapshot } from "../types";
+import { LoadFailed, describeError } from "./ResultsView";
 
 interface Props {
   client: EngineClient;
@@ -21,10 +22,13 @@ export function DecisionsView({ client, health, runs, onOpenRun }: Props) {
   const [tick, setTick] = useState(0);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     const t = setTimeout(() => {
-      client.allDecisions({ decision: filter, search, offset, limit: LIMIT }).then(setPage).catch(() => setPage(null));
+      client.allDecisions({ decision: filter, search, offset, limit: LIMIT })
+        .then((p) => { setPage(p); setLoadError(null); })
+        .catch((e) => { setPage(null); setLoadError(describeError(e)); });
     }, 200);
     return () => clearTimeout(t);
   }, [client, filter, search, offset, tick]);
@@ -133,7 +137,11 @@ export function DecisionsView({ client, health, runs, onOpenRun }: Props) {
               </tr>
             ))}
             {page && rows.length === 0 && <tr><td colSpan={9} className="muted">No decisions yet. Approve or reject suggestions in a run's Review queue.</td></tr>}
-            {!page && <tr><td colSpan={9} className="muted">Loading…</td></tr>}
+            {!page && (
+              <tr><td colSpan={9} className="muted">
+                {loadError ? <LoadFailed error={loadError} onRetry={() => setTick((t) => t + 1)} /> : "Loading…"}
+              </td></tr>
+            )}
           </tbody>
         </table>
       </div>
