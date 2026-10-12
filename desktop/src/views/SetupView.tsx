@@ -189,6 +189,15 @@ export function SetupView({ client, health, initialSource, onStarted }: Props) {
           </label>
         </div>
 
+        <label className="check">
+          <input type="checkbox" checked={overrides.clustering_enabled === "true"}
+            onChange={(e) => updateOverride("clustering_enabled", e.target.checked ? "true" : "")} />
+          <span>
+            Also cluster unmatched filings and suggest a mapping per cluster (Stages 5–7)
+            <small className="muted"> — optional analysis; adds considerable run time</small>
+          </span>
+        </label>
+
         <button className="link" onClick={() => setAdvanced((a) => !a)}>
           {advanced ? "Hide" : "Show"} advanced settings
         </button>

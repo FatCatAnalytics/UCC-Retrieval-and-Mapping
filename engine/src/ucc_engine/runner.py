@@ -24,7 +24,7 @@ import pandas as pd
 from .compat import AssetExecutionContext
 from .config import PipelineConfig, app_data_dir
 from .datasources import DataSource, SourceSpec, make_datasource, public_spec
-from .registry import KEEP_AFTER_RUN, PIPELINE, TOTAL_WEIGHT, Stage, run_stage
+from .registry import KEEP_AFTER_RUN, PIPELINE, Stage, is_enabled, run_stage, total_weight
 
 REVIEW_BANDS = ("REVIEW_HIGH", "REVIEW_MEDIUM", "REVIEW_LOW")
 REVIEW_COLUMNS = [
@@ -198,6 +198,11 @@ class PipelineRun:
             self._persist()
 
     def _exec_stage(self, stage: Stage, state: StageState) -> None:
+        if not is_enabled(stage, self.config):
+            run_stage(stage, self.config, None, self._cache)  # pass-through, keeps the DAG wiring intact
+            state.status = "skipped"
+            self._log("INFO", f"– {stage.label} skipped ({stage.enabled_by} = false)", stage.name)
+            return
         state.status, state.started_at = "running", _now()
         self.current_stage = stage.name
         t0 = time.perf_counter()
@@ -224,7 +229,7 @@ class PipelineRun:
     # ---------------------------------------------------------------- snapshot
     def progress(self) -> float:
         done = sum(s.weight for s, st in zip(PIPELINE, self.stages) if st.status == "done")
-        return round(done / TOTAL_WEIGHT, 4)
+        return round(done / total_weight(self.config), 4)
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -259,6 +264,13 @@ class PipelineRun:
     def _enriched(self) -> Optional[pd.DataFrame]:
         df = self._cache.get("universe_enriched_results")
         if isinstance(df, pd.DataFrame):
+            if df.attrs:
+                # The core parks the model + cluster embeddings in df.attrs, and pandas
+                # deep-copies attrs into every derived Series - a groupby over a few
+                # thousand clusters took >10 s because of it. Serve a view without attrs.
+                df = df.copy(deep=False)
+                df.attrs = {}
+                self._cache["universe_enriched_results"] = df
             return df
         # After a restart: rebuild from the full_results export.
         files = sorted(self.output_dir.glob("full_results_*.csv"))

@@ -72,6 +72,7 @@ field-for-field (thresholds, clustering, performance, lead-bank, rerank), plus:
 
 | Field | Default | Meaning |
 |---|---|---|
+| `clustering_enabled` | `false` | run Stages 5-7 (cluster unmatched rows, suggest a mapping per cluster). Off: unmatched rows are still labelled `NEW_ENTITY` and exported, without cluster columns; the stages show as *skipped* |
 | `embedding_backend` | `auto` | `fastembed` if installed, else `sentence-transformers` |
 | `embedding_model` | `BAAI/bge-small-en-v1.5` | 384-dim; keep in sync with any persisted query cache |
 | `model_dir` | `""` | offline model folder - local path **or network share / UNC path** - holding both models; when set nothing is downloaded (see below) |

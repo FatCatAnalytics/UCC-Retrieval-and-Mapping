@@ -121,6 +121,35 @@ def test_registry_is_topologically_ordered_and_matches_core_signatures():
         seen.add(st.name)
 
 
+def test_clustering_stages_are_skipped_by_default_but_keep_the_dag_wired():
+    import numpy as np
+
+    from ucc_engine.config import PipelineConfig
+    from ucc_engine.registry import CLUSTER_COLUMNS, STAGES_BY_NAME, is_enabled, run_stage, total_weight
+
+    cfg = PipelineConfig()
+    assert cfg.clustering_enabled is False
+    clustering = [STAGES_BY_NAME[n] for n in ("clustered_results", "merged_cluster_results", "suggested_mapping_results")]
+    assert all(not is_enabled(s, cfg) for s in clustering)
+    assert all(is_enabled(s, PipelineConfig(clustering_enabled=True)) for s in clustering)
+    assert total_weight(cfg) < total_weight(PipelineConfig(clustering_enabled=True))
+
+    # Frame as it leaves Stage 4: one matched row, one pending, one NO_MASTER_STATE_PAIR.
+    df = pd.DataFrame({
+        "SECP_NAME": ["A", "B", "C"], "SECP_NAME_NORMALIZED": ["a", "b", "c"],
+        "SECP_NAME_MAPPED": ["Acme", None, None], "confidence": ["AUTO", None, "NO_MASTER_STATE_PAIR"],
+    })
+    df.attrs["embedding_model"] = object()
+    cache = {"advanced_embedding_results": df, "master_embeddings_cache": {}, "normalized_master_data": {}}
+    for s in clustering:
+        out = run_stage(s, cfg, None, cache)
+    assert out is cache["suggested_mapping_results"]
+    assert out["confidence"].tolist() == ["AUTO", "NEW_ENTITY", "NO_MASTER_STATE_PAIR"]
+    assert set(CLUSTER_COLUMNS) <= set(out.columns) and out["cluster_id"].isna().all()
+    assert np.isnan(out["cluster_size"].mean())  # what pipeline_outputs computes for the summary file
+    assert out.attrs == {} and df.attrs  # input untouched, output carries no model handle
+
+
 def test_api_health_and_validation(tmp_path: Path):
     from fastapi.testclient import TestClient
 

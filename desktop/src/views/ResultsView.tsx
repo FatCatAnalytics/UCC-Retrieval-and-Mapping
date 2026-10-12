@@ -30,7 +30,7 @@ export function ResultsView({ client, run }: Props) {
       </header>
 
       <nav className="tabs">
-        {(["summary", "review", "clusters", "outputs"] as Tab[]).map((t) => (
+        {(["summary", "review", "clusters", "outputs"] as Tab[]).filter((t) => t !== "clusters" || !summary || summary.clusters > 0).map((t) => (
           <button key={t} className={tab === t ? "on" : ""} onClick={() => setTab(t)}>
             {t === "summary" && "Summary"}
             {t === "review" && `Review queue${summary ? ` (${summary.review_needed.toLocaleString()})` : ""}`}
@@ -77,7 +77,8 @@ function SummaryTab({ run, summary, client }: { run: RunSnapshot; summary: Summa
         <Stat label="UCC records" value={summary.total_records} />
         <Stat label="Auto-mapped" value={summary.auto_mapped} sub={pct(summary.auto_mapped)} tone="good" />
         <Stat label="Review needed" value={summary.review_needed} sub={pct(summary.review_needed)} tone="warn" />
-        <Stat label="New entities" value={summary.new_entities} sub={`${summary.clusters.toLocaleString()} clusters`} />
+        <Stat label="New entities" value={summary.new_entities}
+          sub={summary.clusters > 0 ? `${summary.clusters.toLocaleString()} clusters` : `${pct(summary.new_entities)} · not in master`} />
         <Stat label="With Firm ID" value={summary.records_with_firm_id} sub={`${summary.unique_firm_ids.toLocaleString()} firms`} />
       </div>
 

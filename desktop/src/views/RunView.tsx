@@ -100,6 +100,7 @@ export function RunView({ client, run, onUpdate, onViewResults }: Props) {
                     {s.status === "done" && s.seconds != null ? `${s.seconds.toFixed(1)}s` : ""}
                     {s.rows != null ? ` · ${s.rows.toLocaleString()} rows` : ""}
                     {s.status === "running" ? "running…" : ""}
+                    {s.status === "skipped" ? "skipped" : ""}
                   </span>
                 </div>
               ))}
