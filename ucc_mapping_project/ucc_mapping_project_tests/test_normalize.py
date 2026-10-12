@@ -4,6 +4,7 @@
 # =============================================================================
 import pytest
 from ucc_mapping_project.utils import (
+    pre_clean_name,
     normalize_name,
     soundex,
     detect_entity_type,
@@ -421,3 +422,36 @@ class TestFalsePositivePrevention:
         assert has_shared_meaningful_identifier(
             "FIRST AMERICAN BANK", "FIRST AMERICAN BANK NA"
         ) is True
+
+
+
+# ---------------------------------------------------------------------------
+# pre_clean_name: structural junk around the lender's name (added 2026-10)
+# ---------------------------------------------------------------------------
+class TestPreClean:
+    @pytest.mark.parametrize("raw,expected", [
+        ("STARION BANK (LENDER AND LETTER OF CREDIT ISSUER)", "STARION BANK"),
+        ("WELLS FARGO BANK, NATIONAL ASSOCIATION, AS ADMINISTRIVE AGENT", "WELLS FARGO BANK"),
+        ("PLAINSCAPITAL BANK, A TEXAS STATE BANKING ASSOCIATION", "PLAINSCAPITAL BANK"),
+        ("TD BANK, NA, AS SUCCESSOR BY MERGER TO MERCANTILE BANK", "TD BANK"),
+        ("CENTENNIAL BANK F/K/A LIBERTY BANK OF ARKANSAS", "CENTENNIAL BANK"),
+        ("KEY EQUIPMENT FINANCE, A DIVISION OF KEYBANK NA", "KEYBANK"),
+        ("FEDERAL DEPOSIT INSURANCE CORPORATION AS RECEIVER OF FIRST REPUBLIC BANK, SAN FRANCISCO, CALIFORNIA", "FIRST REPUBLIC BANK"),
+        ("PARK BANK- BROOKFIELD", "PARK BANK"),
+        ("BANK ONE, NA, WITH ITS MAIN OFFICE IN COLUMBUS, OH", "BANK ONE"),
+        ("FIRST-CITIZENS BANK & TRUST COMPANY", "FIRST-CITIZENS BANK & TRUST COMPANY"),
+        ("STATE BANK OF TEXAS", "STATE BANK OF TEXAS"),
+    ])
+    def test_cases(self, raw, expected):
+        assert pre_clean_name(raw) == expected
+
+    def test_never_empties_a_name(self):
+        assert pre_clean_name("NA") == "NA"
+        assert pre_clean_name("(AS AGENT)") == "(AS AGENT)"
+
+    def test_normalize_uses_pre_clean(self):
+        assert normalize_name("KEY EQUIPMENT FINANCE, A DIVISION OF KEYBANK NA") == "KEYBANK"
+        assert normalize_name("WESTERN ALLIANCE BANK, AS SUCCESSOR-IN-INTEREST TO BRIDGE BANK, N.A.") == "WESTERN ALLIANCE BANK"
+
+    def test_order_swapped_names_stay_below_review_floor(self):
+        assert combined_fuzzy_score("NATIONAL CITY BANK", "CITY NATIONAL BANK") < 85

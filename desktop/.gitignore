@@ -1,0 +1,8 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+# frozen engine sidecar(s) - built by engine/scripts/build_sidecar.py
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep
+.DS_Store

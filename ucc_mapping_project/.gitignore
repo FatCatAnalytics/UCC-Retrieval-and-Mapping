@@ -54,6 +54,8 @@ ucc_mapping_project/Outputs/
 # ML models & caches (large binary files)
 # =============================================================================
 **/models/bge-small-en-v1.5/
+**/.cache/
+*.npy
 *.pkl
 *.pickle
 *.joblib

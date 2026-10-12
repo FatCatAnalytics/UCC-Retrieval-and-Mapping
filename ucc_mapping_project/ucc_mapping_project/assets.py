@@ -2162,6 +2162,382 @@ def universe_enriched_results(
 
 
 # =============================================================================
+# Updated master mapping + merged raw file
+# =============================================================================
+#
+# Goal
+# ----
+# Produce a single "updated master" mapping file that extends the original
+# Master Mapping CSV with the new high-confidence resolutions the pipeline
+# generated this run. Then join that updated mapping back onto the raw UCC
+# file to produce a row-per-filing merged artefact that downstream analyses
+# (notably the future DUNS-aware lead-bank work) can consume.
+#
+# Why these are separate assets
+# -----------------------------
+# * ``updated_master_data`` is the human-verifiable artefact: "here is what
+#   we knew before + what the pipeline learned this run". It contains the
+#   same five columns as the original Master Mapping so it can be reviewed
+#   in Excel and, if accepted, swapped in as the next run's master.
+# * ``merged_raw_with_firm_id`` is the operational artefact: every raw UCC
+#   row enriched with ``SECP_NAME_MAPPED`` / ``Firm_ID`` / ``match_method``.
+#   Re-reads the raw file fresh (not via ``ucc_raw_data``) so that when the
+#   user upgrades to the full schema (DUNS, F_STATEMENT_TYPE_CODE, etc.)
+#   those columns flow through automatically without code changes.
+#
+# Eligible match methods (per 2026-06-16 design discussion)
+# ----------------------------------------------------------
+# Stage 1-3 results only. Stage 4 (Advanced Match) is deliberately excluded
+# pending separate review. Both deterministic and "Ambiguous" variants are
+# included; ambiguous rows are not 1:1 mappings, but the user wants them
+# visible in the updated master for review purposes.
+# =============================================================================
+
+_UPDATED_MASTER_MATCH_METHODS: tuple = (
+    "Exact Match (Raw)",
+    "Exact Match (Normalized)",
+    "Exact Match (Raw - State Ambiguous)",
+    "Exact Match (Normalized - Ambiguous)",
+    "Fuzzy Match",
+    "Fuzzy Match (Ambiguous)",
+)
+
+# Columns kept in the updated master file. Mirrors the original Master
+# Mapping CSV schema so the file is drop-in usable as the next run's master.
+_UPDATED_MASTER_COLUMNS: tuple = (
+    "DEBT_STATE",
+    "SECP_STATE",
+    "SECP_NAME",
+    "SECP_NAME_MAPPED",
+    "Firm ID",
+)
+
+
+@asset(
+    description=(
+        "Updated master mapping: original Master Mapping rows + newly resolved "
+        "(SECP_NAME -> SECP_NAME_MAPPED, Firm_ID) rows from Stage 1-3 of this "
+        "run. Stage 4 (Advanced Match) is intentionally excluded."
+    ),
+    compute_kind="pandas",
+    group_name="reporting",
+    tags={"domain": "ucc-mapping", "stage": "reporting"},
+)
+def updated_master_data(
+    context: AssetExecutionContext,
+    config: PipelineConfig,
+    master_mapping_data: pd.DataFrame,
+    universe_enriched_results: pd.DataFrame,
+) -> Output[pd.DataFrame]:
+    """Append newly-resolved Stage 1-3 mappings to the original master file.
+
+    Schema matches the original ``Master Mapping.csv`` so the output is
+    drop-in usable as the next run's master file.
+
+    Conflict resolution
+    -------------------
+    On a key collision (same ``(DEBT_STATE, SECP_STATE, SECP_NAME)`` triple
+    present in both the original master AND the new pipeline output) the
+    **original master row wins**. The original master is the human-verified
+    source of truth; pipeline output is provisional. This means re-running
+    the pipeline never overwrites a known-good mapping with a guess.
+
+    Writes ``updated_master_{ts}.csv`` to ``config.output_dir``.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # 1. Normalise the original master to the canonical column set.
+    # ------------------------------------------------------------------
+    master = master_mapping_data.copy()
+    master = _standardize_state_columns(master)
+    if "Firm ID" not in master.columns and "Firm_ID" in master.columns:
+        # Original master file uses 'Firm ID' (space). Defensive rename in
+        # case an upstream change normalised it to underscore form.
+        master = master.rename(columns={"Firm_ID": "Firm ID"})
+    keep_master_cols = [c for c in _UPDATED_MASTER_COLUMNS if c in master.columns]
+    master = master[keep_master_cols].copy()
+    master["_source"] = "original_master"
+    n_master = len(master)
+
+    # ------------------------------------------------------------------
+    # 2. Filter pipeline output to eligible match methods + valid mapping.
+    # ------------------------------------------------------------------
+    enriched = universe_enriched_results.copy()
+    if "match_method" not in enriched.columns:
+        context.log.warning(
+            "updated_master_data: universe_enriched_results has no "
+            "match_method column; emitting original master only."
+        )
+        eligible = enriched.iloc[0:0].copy()
+    else:
+        method_mask = enriched["match_method"].isin(_UPDATED_MASTER_MATCH_METHODS)
+        # Must also have a non-null mapped name to be useful as a master row.
+        if "SECP_NAME_MAPPED" in enriched.columns:
+            mapped_mask = (
+                enriched["SECP_NAME_MAPPED"].notna()
+                & (enriched["SECP_NAME_MAPPED"].astype("string").str.strip() != "")
+            )
+        else:
+            mapped_mask = pd.Series(False, index=enriched.index)
+        eligible = enriched.loc[method_mask & mapped_mask].copy()
+
+    # ------------------------------------------------------------------
+    # 3. Project pipeline output into the master schema.
+    # ------------------------------------------------------------------
+    if len(eligible):
+        if "Firm_ID" in eligible.columns and "Firm ID" not in eligible.columns:
+            eligible["Firm ID"] = eligible["Firm_ID"]
+        elif "Firm ID" not in eligible.columns:
+            eligible["Firm ID"] = pd.NA
+        new_rows_cols = [c for c in _UPDATED_MASTER_COLUMNS if c in eligible.columns]
+        new_rows = eligible[new_rows_cols].copy()
+        new_rows = _standardize_state_columns(new_rows)
+        new_rows["_source"] = (
+            "pipeline_" + eligible["match_method"].astype("string").fillna("unknown")
+        ).values
+    else:
+        new_rows = pd.DataFrame(
+            columns=list(_UPDATED_MASTER_COLUMNS) + ["_source"]
+        )
+
+    n_new_candidate = len(new_rows)
+
+    # ------------------------------------------------------------------
+    # 4. Concat master first, new rows second; dedupe on the three-column
+    #    key keeping the FIRST occurrence (= original master wins).
+    # ------------------------------------------------------------------
+    combined = pd.concat([master, new_rows], ignore_index=True, sort=False)
+    # The master is read as nullable Int64 but pipeline rows carry a float
+    # Firm_ID (NaN-propagated), so the concat demotes the column to float and
+    # the CSV would print "1257.0". Restore the master's integer formatting.
+    if "Firm ID" in combined.columns:
+        fid = pd.to_numeric(combined["Firm ID"], errors="coerce")
+        if (fid.dropna() % 1 == 0).all():
+            combined["Firm ID"] = fid.astype("Int64")
+    key_cols = ["DEBT_STATE", "SECP_STATE", "SECP_NAME"]
+    # Filter to rows that have a non-null name (key would otherwise be useless).
+    has_name = combined["SECP_NAME"].notna() & (
+        combined["SECP_NAME"].astype("string").str.strip() != ""
+    )
+    combined = combined.loc[has_name].copy()
+    before_dedup = len(combined)
+    combined = combined.drop_duplicates(subset=key_cols, keep="first").reset_index(drop=True)
+    after_dedup = len(combined)
+
+    n_added = max(0, after_dedup - n_master)
+    n_conflicts_resolved = max(0, n_new_candidate - n_added)
+
+    context.log.info(
+        f"updated_master_data: master={n_master:,} rows; "
+        f"new candidates={n_new_candidate:,}; added={n_added:,}; "
+        f"conflicts (kept master)={n_conflicts_resolved:,}; "
+        f"final={after_dedup:,}"
+    )
+    if before_dedup != after_dedup:
+        context.log.info(
+            f"updated_master_data: deduped {before_dedup - after_dedup:,} "
+            "duplicate keys (original master wins on conflict)"
+        )
+
+    # Persistence: drop the internal _source column from the canonical CSV
+    # (mirrors original master schema), but keep a sidecar with provenance.
+    out_path = output_dir / f"updated_master_{timestamp}.csv"
+    sidecar_path = output_dir / f"updated_master_{timestamp}_with_source.csv"
+    canonical_cols = [c for c in _UPDATED_MASTER_COLUMNS if c in combined.columns]
+    try:
+        combined[canonical_cols].to_csv(out_path, index=False)
+        combined.to_csv(sidecar_path, index=False)
+        context.log.info(f"updated_master_data: wrote {out_path}")
+        context.log.info(f"updated_master_data: wrote {sidecar_path} (with _source)")
+    except Exception as e:
+        context.log.warning(f"updated_master_data: failed to write CSV: {e!r}")
+
+    return Output(
+        value=combined,
+        metadata={
+            "original_master_rows": MetadataValue.int(n_master),
+            "new_candidate_rows": MetadataValue.int(n_new_candidate),
+            "rows_added": MetadataValue.int(n_added),
+            "conflicts_kept_master": MetadataValue.int(n_conflicts_resolved),
+            "final_row_count": MetadataValue.int(after_dedup),
+            "output_path": MetadataValue.path(str(out_path)),
+            "sidecar_path": MetadataValue.path(str(sidecar_path)),
+            "timestamp": MetadataValue.text(timestamp),
+            "preview": MetadataValue.md(_preview_markdown(combined[canonical_cols])),
+        },
+    )
+
+
+@asset(
+    description=(
+        "Merge the raw UCC file with the updated master mapping on "
+        "(DEBT_STATE, SECP_STATE, SECP_NAME) to bring SECP_NAME_MAPPED / "
+        "Firm_ID onto every raw filing row. Re-reads the raw file fresh so "
+        "that any extra columns present in the source CSV (e.g. DUNS, "
+        "F_STATEMENT_TYPE_CODE) flow through automatically."
+    ),
+    compute_kind="pandas",
+    group_name="reporting",
+    tags={"domain": "ucc-mapping", "stage": "reporting"},
+)
+def merged_raw_with_firm_id(
+    context: AssetExecutionContext,
+    config: PipelineConfig,
+    updated_master_data: pd.DataFrame,
+) -> Output[pd.DataFrame]:
+    """Row-per-filing merge of raw UCC against the updated master mapping.
+
+    Re-reads the raw CSV directly (not via ``ucc_raw_data``) so:
+      1. The merged file has **all** raw columns, not just the three
+         match-key columns. When the user later swaps in the full
+         production CSV (with DUNS / F_STATEMENT_TYPE_CODE / etc.), those
+         columns appear in the output automatically.
+      2. The merged file has **one row per filing**, not deduped. Lead-bank
+         and downstream count-based analyses need raw filing counts.
+
+    Merge keys: ``DEBT_STATE``, ``SECP_STATE``, ``SECP_NAME``.
+    Adds: ``SECP_NAME_MAPPED``, ``Firm_ID``, ``Firm_ID_source``
+          ("original_master" or "pipeline_<match_method>" when matched,
+          else NaN).
+
+    TODO (next PR, blocked on full production CSV):
+      - Switch ``lead_bank_designation`` to consume this asset.
+      - Add DUNS-based company key when ``config.duns_column`` resolves.
+      - Add strict ``F_STATEMENT_TYPE_CODE`` (2=ORIGINAL, 4=CONTINUATION)
+        classifier with fallback to the existing substring path.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # 1. Load the full raw CSV (all columns, no dedupe).
+    # ------------------------------------------------------------------
+    try:
+        raw_full = pd.read_csv(
+            config.ucc_file,
+            sep=_detect_delimiter(config.ucc_file),
+            encoding="latin-1",
+        )
+    except Exception as e:
+        context.log.error(
+            f"merged_raw_with_firm_id: could not read raw UCC file "
+            f"({config.ucc_file}): {e!r}"
+        )
+        empty = pd.DataFrame(
+            columns=list(RAW_MATCH_COLUMNS)
+            + ["SECP_NAME_MAPPED", "Firm_ID", "Firm_ID_source"]
+        )
+        return Output(
+            value=empty,
+            metadata={
+                "row_count": MetadataValue.int(0),
+                "notes": MetadataValue.text("Raw CSV unreadable; merge skipped."),
+            },
+        )
+
+    raw_full = _standardize_state_columns(raw_full)
+    n_raw = len(raw_full)
+    context.log.info(f"merged_raw_with_firm_id: loaded {n_raw:,} raw filings")
+
+    # ------------------------------------------------------------------
+    # 2. Verify required join keys are present in the raw file.
+    # ------------------------------------------------------------------
+    missing_in_raw = [c for c in RAW_MATCH_COLUMNS if c not in raw_full.columns]
+    if missing_in_raw:
+        context.log.error(
+            f"merged_raw_with_firm_id: raw CSV missing join key columns "
+            f"{missing_in_raw}; emitting raw file unchanged."
+        )
+        out = raw_full.copy()
+        for c in ("SECP_NAME_MAPPED", "Firm_ID", "Firm_ID_source"):
+            if c not in out.columns:
+                out[c] = pd.NA
+        out_path = output_dir / f"merged_raw_with_firm_id_{timestamp}.csv"
+        try:
+            out.to_csv(out_path, index=False)
+        except Exception as e:
+            context.log.warning(f"merged_raw_with_firm_id: write failed: {e!r}")
+        return Output(
+            value=out,
+            metadata={
+                "row_count": MetadataValue.int(len(out)),
+                "missing_join_keys": MetadataValue.json(missing_in_raw),
+                "output_path": MetadataValue.path(str(out_path)),
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Prep the right-hand side of the merge: updated_master, with
+    #    'Firm ID' renamed to 'Firm_ID' for downstream consistency. Dedupe
+    #    on the 3-key so a one-to-many merge doesn't explode row counts;
+    #    keep the first row (== original master / earliest pipeline source).
+    # ------------------------------------------------------------------
+    master = updated_master_data.copy()
+    master = _standardize_state_columns(master)
+    if "Firm_ID" not in master.columns and "Firm ID" in master.columns:
+        master = master.rename(columns={"Firm ID": "Firm_ID"})
+    rhs_cols = [
+        c for c in ("DEBT_STATE", "SECP_STATE", "SECP_NAME",
+                    "SECP_NAME_MAPPED", "Firm_ID", "_source")
+        if c in master.columns
+    ]
+    rhs = master[rhs_cols].drop_duplicates(
+        subset=["DEBT_STATE", "SECP_STATE", "SECP_NAME"], keep="first"
+    )
+    if "_source" in rhs.columns:
+        rhs = rhs.rename(columns={"_source": "Firm_ID_source"})
+
+    # ------------------------------------------------------------------
+    # 4. Left-merge: raw on the left so every filing survives, even those
+    #    with no master mapping (Firm_ID will be NaN for those).
+    # ------------------------------------------------------------------
+    merged = raw_full.merge(rhs, on=list(RAW_MATCH_COLUMNS), how="left")
+
+    n_with_firm = (
+        int(merged["Firm_ID"].notna().sum()) if "Firm_ID" in merged.columns else 0
+    )
+    n_with_mapped = (
+        int(merged["SECP_NAME_MAPPED"].notna().sum())
+        if "SECP_NAME_MAPPED" in merged.columns else 0
+    )
+    pct_firm = (n_with_firm / n_raw * 100) if n_raw else 0.0
+    pct_mapped = (n_with_mapped / n_raw * 100) if n_raw else 0.0
+
+    context.log.info(
+        f"merged_raw_with_firm_id: {n_with_mapped:,}/{n_raw:,} rows mapped "
+        f"({pct_mapped:.1f}%); {n_with_firm:,}/{n_raw:,} rows have Firm_ID "
+        f"({pct_firm:.1f}%)"
+    )
+
+    # ------------------------------------------------------------------
+    # 5. Write the merged file.
+    # ------------------------------------------------------------------
+    out_path = output_dir / f"merged_raw_with_firm_id_{timestamp}.csv"
+    try:
+        merged.to_csv(out_path, index=False)
+        context.log.info(f"merged_raw_with_firm_id: wrote {out_path}")
+    except Exception as e:
+        context.log.warning(f"merged_raw_with_firm_id: write failed: {e!r}")
+
+    return Output(
+        value=merged,
+        metadata={
+            "row_count": MetadataValue.int(len(merged)),
+            "rows_with_mapped_name": MetadataValue.int(n_with_mapped),
+            "rows_with_firm_id": MetadataValue.int(n_with_firm),
+            "pct_with_firm_id": MetadataValue.float(round(pct_firm, 2)),
+            "output_path": MetadataValue.path(str(out_path)),
+            "timestamp": MetadataValue.text(timestamp),
+            "columns": MetadataValue.json(list(merged.columns)),
+        },
+    )
+
+
+# =============================================================================
 # Stage 8: Lead-bank designation
 # =============================================================================
 

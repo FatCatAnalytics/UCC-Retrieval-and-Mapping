@@ -40,7 +40,7 @@ class PipelineConfig(ConfigurableResource):
     )
     
     # Matching thresholds
-    fuzzy_auto_threshold: int = Field(default=96, description="Auto-approve fuzzy matches >= this (tightened)")
+    fuzzy_auto_threshold: int = Field(default=90, description="Auto-approve fuzzy matches >= this. Hold-out on the June 2026 master: precision 99.0% at 96 and still 99.0% at 90, recall 55% -> 62%; see engine/tests/test_match_quality.py")
     fuzzy_review_threshold: int = Field(default=85, description="Review fuzzy matches >= this (wider net for review)")
     fuzzy_min_threshold: int = Field(default=80, description="Minimum fuzzy score to consider")
     
@@ -133,10 +133,15 @@ class PipelineConfig(ConfigurableResource):
         description="Number of top candidates per REVIEW_MEDIUM query to feed the cross-encoder."
     )
     advanced_cross_encoder_promote_to_auto: float = Field(
-        default=0.92,
+        default=1.01,
         description="Cross-encoder relevance score above which a REVIEW_MEDIUM match is promoted "
                     "to AUTO. Cross-encoder outputs are typically in [-10, +10] passed through "
-                    "a sigmoid; we read the sigmoid score (0..1)."
+                    "a sigmoid; we read the sigmoid score (0..1). Default 1.01 = never: the "
+                    "reranker is review-only (it can still lift MEDIUM to REVIEW_HIGH). In the "
+                    "June 2026 run 983 of 1,064 fuzzy/embedding AUTO names came through this "
+                    "promotion at composite 0.85-0.89 and a hand-labelled sample put ~25% of "
+                    "them on the wrong bank (generic names with a place qualifier). Set to 0.92 "
+                    "to restore the old behaviour."
     )
     advanced_cross_encoder_promote_to_high: float = Field(
         default=0.80,

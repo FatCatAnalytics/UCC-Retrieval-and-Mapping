@@ -1,0 +1,40 @@
+[project]
+name = "ucc-engine"
+version = "0.1.0"
+description = "Headless UCC → master-mapping engine with a local HTTP API (Tauri sidecar). No Dagster, no network inference."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "rapidfuzz>=3.9",
+    "faiss-cpu>=1.8",
+    "tabulate>=0.9",          # DataFrame.to_markdown() in the core's previews
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pydantic>=2.7",
+    # Local embedding + cross-encoder inference via ONNX Runtime (no torch).
+    "fastembed>=0.7",
+]
+
+[project.optional-dependencies]
+# Original torch-based models (bit-for-bit parity with the Dagster project).
+st = ["sentence-transformers>=3.0"]
+# SQL data source (wire your connection string later).
+sql = ["sqlalchemy>=2.0"]
+# Freeze the engine into a single sidecar binary for the Tauri app.
+build = ["pyinstaller>=6.6"]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+ucc-engine = "ucc_engine.cli:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
