@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +30,17 @@ class PromoteRequest(BaseModel):
 
 class PreviewRequest(BaseModel):
     source: SourceSpec = Field(..., discriminator="type")
+
+
+class DecisionItem(BaseModel):
+    key: str = Field(..., description="`key` of a review-queue row")
+    decision: Optional[Literal["approved", "rejected"]] = Field(None, description="null clears the decision")
+    mapped_name: Optional[str] = Field(None, description="override the suggested SECP_NAME_MAPPED")
+    firm_id: Optional[Any] = Field(None, description="override the Firm ID (default: Universe lookup by mapped name)")
+
+
+class DecisionsRequest(BaseModel):
+    items: List[DecisionItem] = Field(..., min_length=1)
 
 
 def create_app(store: Optional[RunStore] = None) -> FastAPI:
@@ -130,9 +141,34 @@ def create_app(store: Optional[RunStore] = None) -> FastAPI:
         limit: int = Query(100, ge=1, le=1000),
         sort: str = "match_score",
         descending: bool = True,
+        decision: Literal["", "pending", "approved", "rejected"] = "",
     ) -> Dict[str, Any]:
-        return _get(run_id).review(confidence=confidence, search=search, method=method,
-                                   offset=offset, limit=limit, sort=sort, descending=descending)
+        return _get(run_id).review(confidence=confidence, search=search, method=method, offset=offset,
+                                   limit=limit, sort=sort, descending=descending, decision=decision)
+
+    # ----------------------------------------------------- review decisions
+    @app.get("/runs/{run_id}/decisions")
+    def runs_decisions(run_id: str) -> Dict[str, Any]:
+        run = _get(run_id)
+        return {"counts": run.decision_counts(), "decisions": run.decisions}
+
+    @app.put("/runs/{run_id}/decisions")
+    def runs_set_decisions(run_id: str, req: DecisionsRequest) -> Dict[str, Any]:
+        try:
+            return _get(run_id).set_decisions([i.model_dump() for i in req.items])
+        except KeyError as e:
+            raise HTTPException(404, str(e)) from e
+        except (ValueError, RuntimeError) as e:
+            raise HTTPException(409, str(e)) from e
+
+    @app.post("/runs/{run_id}/apply-decisions")
+    def runs_apply_decisions(run_id: str) -> Dict[str, Any]:
+        try:
+            return _get(run_id).apply_decisions()
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e)) from e
+        except RuntimeError as e:
+            raise HTTPException(409, str(e)) from e
 
     @app.get("/runs/{run_id}/clusters")
     def runs_clusters(

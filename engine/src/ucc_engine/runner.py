@@ -34,6 +34,16 @@ REVIEW_COLUMNS = [
     "suggested_mapping", "suggestion_score", "suggestion_confidence", "alternative_suggestions",
 ]
 MAX_LOG_LINES = 5000
+MASTER_KEY = ("DEBT_STATE", "SECP_STATE", "SECP_NAME")
+MASTER_COLUMNS = ("DEBT_STATE", "SECP_STATE", "SECP_NAME", "SECP_NAME_MAPPED", "Firm ID")
+DECISIONS = ("approved", "rejected")
+
+
+def master_key(debt_state: Any, secp_state: Any, secp_name: Any) -> str:
+    """Stable id for a review row = the updated master's own key, normalised like the core does."""
+    def st(v: Any) -> str:
+        return "" if v is None or (isinstance(v, float) and v != v) else str(v).strip().upper()
+    return "|".join([st(debt_state), st(secp_state), "" if secp_name is None else str(secp_name)])
 
 
 def _now() -> str:
@@ -126,6 +136,11 @@ class PipelineRun:
         self._thread: Optional[threading.Thread] = None
         self._cache: Dict[str, Any] = {}
         self.summary: Optional[Dict[str, Any]] = None
+        # Reviewer decisions on the review queue, keyed by master_key(). Persisted
+        # separately from run.json so they survive restarts and are easy to audit.
+        self.decisions: Dict[str, Dict[str, Any]] = {}
+        self._decisions_path = self.run_dir / "decisions.json"
+        self._universe_lookup: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------ logging
     def _log(self, level: str, message: str, stage: str = "engine") -> None:
@@ -331,6 +346,7 @@ class PipelineRun:
         limit: int = 100,
         sort: str = "match_score",
         descending: bool = True,
+        decision: str = "",
     ) -> Dict[str, Any]:
         df = self._enriched()
         if df is None:
@@ -347,12 +363,192 @@ class PipelineRun:
             if "suggested_mapping" in sub.columns:
                 mask |= sub["suggested_mapping"].astype(str).str.contains(s, case=False, na=False, regex=False)
             sub = sub[mask]
+        if decision:
+            keys = self._keys(sub)
+            if decision == "pending":
+                sub = sub[~keys.isin(self.decisions.keys()).values]
+            else:
+                chosen = {k for k, d in self.decisions.items() if d.get("decision") == decision}
+                sub = sub[keys.isin(chosen).values]
         if sort in sub.columns:
             sub = sub.sort_values(sort, ascending=not descending, na_position="last")
         cols = [c for c in REVIEW_COLUMNS if c in sub.columns]
         page = sub.iloc[offset: offset + limit][cols]
-        return {"total": int(len(sub)), "offset": offset, "limit": limit, "columns": cols,
-                "rows": frame_records(page)}
+        rows = frame_records(page)
+        for row in rows:  # attach the reviewer's decision (if any) to each row
+            key = master_key(row.get("DEBT_STATE"), row.get("SECP_STATE"), row.get("SECP_NAME"))
+            row["key"] = key
+            d = self.decisions.get(key)
+            row["decision"] = d.get("decision") if d else None
+            row["decided_mapped_name"] = d.get("mapped_name") if d else None
+            row["decided_firm_id"] = d.get("firm_id") if d else None
+        return {"total": int(len(sub)), "offset": offset, "limit": limit, "columns": cols + ["key", "decision"],
+                "rows": rows, "decision_counts": self.decision_counts()}
+
+    # --------------------------------------------------------------- decisions
+    @staticmethod
+    def _keys(df: pd.DataFrame) -> pd.Series:
+        return pd.Series(
+            [master_key(a, b, c) for a, b, c in zip(df["DEBT_STATE"], df["SECP_STATE"], df["SECP_NAME"])],
+            index=df.index, dtype="object",
+        )
+
+    def _review_frame(self) -> pd.DataFrame:
+        df = self._enriched()
+        if df is None:
+            return pd.DataFrame(columns=list(REVIEW_COLUMNS))
+        return df[df["confidence"].isin(REVIEW_BANDS)]
+
+    def decision_counts(self) -> Dict[str, int]:
+        counts = {"approved": 0, "rejected": 0, "pending": 0, "applied": 0}
+        for d in self.decisions.values():
+            counts[d["decision"]] += 1
+            if d.get("applied"):
+                counts["applied"] += 1
+        counts["pending"] = max(0, int(len(self._review_frame())) - counts["approved"] - counts["rejected"])
+        counts["unapplied_approved"] = sum(1 for d in self.decisions.values()
+                                           if d["decision"] == "approved" and not d.get("applied"))
+        return counts
+
+    def set_decisions(self, items: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+        """Record approve / reject (or clear) for review rows.
+
+        Each item: ``{"key", "decision": "approved"|"rejected"|None, "mapped_name"?, "firm_id"?}``.
+        ``mapped_name`` overrides the pipeline's suggestion; Firm ID is then re-resolved
+        from the Universe (case-insensitive bank-name lookup, as in the pipeline) unless
+        given explicitly.
+        """
+        if self.status in ("queued", "running"):
+            raise RuntimeError("The run is still in progress")
+        review = self._review_frame()
+        known = dict(zip(self._keys(review), review.index))
+        changed = 0
+        for item in items:
+            key = str(item.get("key", ""))
+            if key not in known:
+                raise KeyError(f"{key!r} is not a review-queue row of this run")
+            decision = item.get("decision")
+            if decision is None:
+                changed += self.decisions.pop(key, None) is not None
+                continue
+            if decision not in DECISIONS:
+                raise ValueError(f"decision must be one of {DECISIONS} or null, got {decision!r}")
+            row = review.loc[known[key]]
+            suggested = _json_safe(row.get("SECP_NAME_MAPPED"))
+            mapped = (item.get("mapped_name") or "").strip() or None
+            if mapped is not None and mapped == (suggested or "").strip():
+                mapped = None  # same as the suggestion -> not an override
+            final_name = mapped or suggested
+            if decision == "approved" and not final_name:
+                raise ValueError(f"{key!r}: an approved row needs a mapped name")
+            firm_id = item.get("firm_id")
+            if firm_id in ("", None):  # universe lookup by final name; else keep the pipeline's value
+                firm_id = self._resolve_firm_id(final_name)
+                if firm_id is None and mapped is None:
+                    firm_id = _json_safe(row.get("Firm_ID"))
+            self.decisions[key] = {
+                "decision": decision, "mapped_name": mapped, "firm_id": _json_safe(firm_id),
+                "suggested": suggested, "match_method": _json_safe(row.get("match_method")),
+                "match_score": _json_safe(row.get("match_score")), "confidence": _json_safe(row.get("confidence")),
+                "at": _now(), "applied": False,
+            }
+            changed += 1
+        self._save_decisions()
+        return {"changed": changed, "counts": self.decision_counts()}
+
+    def _save_decisions(self) -> None:
+        tmp = self._decisions_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self.decisions, indent=1, default=str))
+        tmp.replace(self._decisions_path)
+
+    def _resolve_firm_id(self, mapped_name: Optional[str]) -> Any:
+        """Universe lookup by (upper-cased) bank name - the pipeline's Pass 1 rule."""
+        if not mapped_name:
+            return None
+        if self._universe_lookup is None:
+            self._universe_lookup = {}
+            path = Path(self.config.universe_file or "")
+            if path.is_file():
+                try:
+                    uni = pd.read_csv(path, encoding="latin-1", low_memory=False)
+                    name_col = next((c for c in ("Bank Name", "SECP_NAME") if c in uni.columns), None)
+                    id_col = next((c for c in ("Firm ID", "Firm_ID") if c in uni.columns), None)
+                    if name_col and id_col:
+                        for name, fid in zip(uni[name_col], uni[id_col]):
+                            if isinstance(name, str) and name.strip() and pd.notna(fid):
+                                self._universe_lookup.setdefault(name.strip().upper(), _json_safe(fid))
+                except Exception as e:  # noqa: BLE001
+                    self._log("WARNING", f"Could not read universe for Firm ID lookup: {e}")
+        return self._universe_lookup.get(mapped_name.strip().upper())
+
+    def _master_with_source(self) -> Optional[pd.DataFrame]:
+        """The run's updated master incl. provenance, from memory or its CSV."""
+        um = self._cache.get("updated_master_data")
+        if isinstance(um, pd.DataFrame):
+            return um
+        path = self._latest("updated_master_*_with_source.csv")
+        if path:
+            um = pd.read_csv(path, encoding="latin-1", low_memory=False)
+            self._cache["updated_master_data"] = um
+            return um
+        return None
+
+    def apply_decisions(self) -> Dict[str, Any]:
+        """Append every approved review row to the updated master.
+
+        Writes a fresh ``updated_master_<ts>.csv`` (+ ``_with_source``) so the
+        newest file always reflects the reviewer's decisions; earlier files stay
+        for audit. Original master and pipeline rows still win on a key clash.
+        """
+        if self.status in ("queued", "running"):
+            raise RuntimeError("The run is still in progress")
+        base = self._master_with_source()
+        if base is None:
+            raise FileNotFoundError("This run has no updated master to extend")
+        base = base[~base.get("_source", pd.Series("", index=base.index)).astype(str).eq("reviewed_approved")]
+        approved = {k: d for k, d in self.decisions.items() if d["decision"] == "approved"}
+        rows = []
+        for key, d in approved.items():
+            debt, secp, name = key.split("|", 2)
+            rows.append({
+                "DEBT_STATE": debt or None, "SECP_STATE": secp or None, "SECP_NAME": name,
+                "SECP_NAME_MAPPED": d.get("mapped_name") or d.get("suggested"),
+                "Firm ID": d.get("firm_id"), "_source": "reviewed_approved",
+            })
+        new = pd.DataFrame(rows, columns=list(MASTER_COLUMNS) + ["_source"])
+        combined = pd.concat([base, new], ignore_index=True, sort=False)
+        combined = combined.drop_duplicates(subset=list(MASTER_KEY), keep="first").reset_index(drop=True)
+        fid = pd.to_numeric(combined["Firm ID"], errors="coerce")  # keep the master's integer formatting
+        if (fid.dropna() % 1 == 0).all():
+            combined["Firm ID"] = fid.astype("Int64")
+        added = int(combined["_source"].astype(str).eq("reviewed_approved").sum())
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = self.output_dir / f"updated_master_{ts}.csv"
+        if out.exists():  # same second as the pipeline's own file
+            ts += "_reviewed"
+            out = self.output_dir / f"updated_master_{ts}.csv"
+        canonical = [c for c in MASTER_COLUMNS if c in combined.columns]
+        combined[canonical].to_csv(out, index=False)
+        combined.to_csv(self.output_dir / f"updated_master_{ts}_with_source.csv", index=False)
+        self._cache["updated_master_data"] = combined
+        for d in approved.values():
+            d["applied"] = True
+        self._save_decisions()
+        self._log("INFO", f"Applied review decisions: {added:,} approved rows added -> {out.name} "
+                          f"({len(approved) - added:,} skipped as duplicates of existing keys)")
+        if self.summary is not None:
+            src = combined["_source"].astype(str)
+            self.summary["updated_master"] = {
+                "rows": int(len(combined)),
+                "original_rows": int(src.eq("original_master").sum()),
+                "added_rows": int(src.str.startswith("pipeline_").sum()),
+                "approved_rows": added,
+                "file": str(out),
+            }
+        self._persist()
+        return {"approved": len(approved), "added": added, "file": str(out), "rows": int(len(combined)),
+                "counts": self.decision_counts()}
 
     def clusters(self, *, search: str = "", min_size: int = 1, offset: int = 0, limit: int = 100) -> Dict[str, Any]:
         """New-entity clusters (Stage 5-7) summarised one row per cluster."""
@@ -395,7 +591,13 @@ class PipelineRun:
         return files
 
     def promote_master(self, destination: str) -> Dict[str, Any]:
-        """Copy this run's updated master over ``destination`` (keeping a timestamped backup)."""
+        """Copy this run's updated master over ``destination`` (keeping a timestamped backup).
+
+        Approved-but-not-yet-applied review decisions are applied first, so the
+        promoted file always contains everything the reviewer accepted.
+        """
+        if self.decision_counts()["unapplied_approved"]:
+            self.apply_decisions()
         src = self._latest("updated_master_*.csv", exclude="_with_source")
         if not src:
             raise FileNotFoundError("This run produced no updated_master_*.csv")
@@ -433,6 +635,11 @@ class PipelineRun:
         for line in data.get("log_tail", []):
             run._logs.append(LogLine(**line))
             run._seq = max(run._seq, line["seq"])
+        if run._decisions_path.is_file():
+            try:
+                run.decisions = json.loads(run._decisions_path.read_text())
+            except Exception:  # noqa: BLE001 - a corrupt file must not hide the run
+                run.decisions = {}
         return run
 
 

@@ -2299,6 +2299,13 @@ def updated_master_data(
     #    key keeping the FIRST occurrence (= original master wins).
     # ------------------------------------------------------------------
     combined = pd.concat([master, new_rows], ignore_index=True, sort=False)
+    # The master is read as nullable Int64 but pipeline rows carry a float
+    # Firm_ID (NaN-propagated), so the concat demotes the column to float and
+    # the CSV would print "1257.0". Restore the master's integer formatting.
+    if "Firm ID" in combined.columns:
+        fid = pd.to_numeric(combined["Firm ID"], errors="coerce")
+        if (fid.dropna() % 1 == 0).all():
+            combined["Firm ID"] = fid.astype("Int64")
     key_cols = ["DEBT_STATE", "SECP_STATE", "SECP_NAME"]
     # Filter to rows that have a non-null name (key would otherwise be useless).
     has_name = combined["SECP_NAME"].notna() & (

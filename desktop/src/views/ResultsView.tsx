@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { EngineClient, native } from "../api";
-import type { OutputFile, Page, RunSnapshot, Summary } from "../types";
+import type { Decision, DecisionCounts, OutputFile, Page, RunSnapshot, Summary } from "../types";
 
 interface Props {
   client: EngineClient;
@@ -53,12 +53,16 @@ function SummaryTab({ run, summary, client }: { run: RunSnapshot; summary: Summa
   const [dest, setDest] = useState(run.source.type === "csv" ? run.source.master_path : "");
   const [msg, setMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [counts, setCounts] = useState<DecisionCounts | null>(null);
+  useEffect(() => { client.decisions(run.id).then((d) => setCounts(d.counts)).catch(() => setCounts(null)); }, [client, run.id]);
   if (!summary) return <p className="muted">Summary not available.</p>;
 
   const pct = (n: number) => (summary.total_records ? `${((n / summary.total_records) * 100).toFixed(1)}%` : "");
+  const pendingApproved = counts?.unapplied_approved ?? 0;
   const promote = async () => {
     if (!dest) return;
-    if (!confirm(`Overwrite\n${dest}\nwith this run's updated master? A timestamped backup is kept.`)) return;
+    const extra = pendingApproved ? `\n\n${pendingApproved} approved review row(s) not yet in the file will be added first.` : "";
+    if (!confirm(`Overwrite\n${dest}\nwith this run's updated master? A timestamped backup is kept.${extra}`)) return;
     setBusy(true);
     setMsg(null);
     try {
@@ -99,8 +103,11 @@ function SummaryTab({ run, summary, client }: { run: RunSnapshot; summary: Summa
           <p>
             {summary.updated_master.rows.toLocaleString()} rows ={" "}
             {summary.updated_master.original_rows.toLocaleString()} original +{" "}
-            <strong>{summary.updated_master.added_rows.toLocaleString()} newly resolved</strong> (Stages 1–3; the original
-            master always wins on conflicts).
+            <strong>{summary.updated_master.added_rows.toLocaleString()} newly resolved</strong> (Stages 1–3)
+            {summary.updated_master.approved_rows ? (
+              <> + <strong>{summary.updated_master.approved_rows.toLocaleString()} approved in review</strong></>
+            ) : null}
+            {". "}The original master always wins on conflicts.
           </p>
         ) : (
           <p className="muted">Not produced.</p>
@@ -117,6 +124,12 @@ function SummaryTab({ run, summary, client }: { run: RunSnapshot; summary: Summa
             {busy ? "Promoting…" : "Promote as new master"}
           </button>
         </div>
+        {counts && (counts.approved || counts.rejected || counts.pending) ? (
+          <p className="small muted">
+            Review queue: {counts.approved} approved{pendingApproved ? ` (${pendingApproved} not yet added — promoting adds them)` : ""},{" "}
+            {counts.rejected} rejected, {counts.pending} still to decide.
+          </p>
+        ) : null}
         {msg && <p className="small">{msg}</p>}
       </section>
 
@@ -158,21 +171,63 @@ function Bars({ data, total, unit = "" }: { data: Record<string, number>; total:
 }
 
 // ------------------------------------------------------------------- review
+type DecisionFilter = "" | "pending" | "approved" | "rejected";
+
 function ReviewTab({ run, client }: { run: RunSnapshot; client: EngineClient }) {
   const [bands, setBands] = useState<string[]>(BANDS);
   const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState<DecisionFilter>("");
   const [page, setPage] = useState<Page | null>(null);
   const [offset, setOffset] = useState(0);
+  const [tick, setTick] = useState(0);
+  const [edits, setEdits] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState("");
+  const [msg, setMsg] = useState<string | null>(null);
   const limit = 100;
 
   useEffect(() => {
     const t = setTimeout(() => {
-      client.review(run.id, { confidence: bands, search, offset, limit }).then(setPage).catch(() => setPage(null));
+      client.review(run.id, { confidence: bands, search, decision: filter, offset, limit }).then(setPage).catch(() => setPage(null));
     }, 200);
     return () => clearTimeout(t);
-  }, [client, run.id, bands, search, offset]);
+  }, [client, run.id, bands, search, filter, offset, tick]);
 
-  const cols = ["SECP_NAME", "DEBT_STATE", "SECP_STATE", "SECP_NAME_MAPPED", "match_method", "match_score", "confidence", "Firm_ID", "ambiguous_master_candidates"];
+  const counts = page?.decision_counts;
+  const refresh = () => setTick((t) => t + 1);
+
+  const decide = async (items: { key: string; decision: Decision | null; mapped_name?: string | null }[]) => {
+    setBusy("decide");
+    setMsg(null);
+    try {
+      await client.setDecisions(run.id, items);
+      setEdits((e) => { const n = { ...e }; items.forEach((i) => delete n[i.key]); return n; });
+      refresh();
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const apply = async () => {
+    setBusy("apply");
+    setMsg(null);
+    try {
+      const r = await client.applyDecisions(run.id);
+      setMsg(`Added ${r.added.toLocaleString()} approved row(s) to the updated master → ${r.file.split(/[\\/]/).pop()} (${r.rows.toLocaleString()} rows).`);
+      refresh();
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const rows = page?.rows ?? [];
+  const undecidedShown = rows.filter((r) => !r.decision);
+  const str = (v: unknown) => (v == null ? "" : String(v));
+  const num = (v: unknown) => (typeof v === "number" ? v.toFixed(3) : str(v));
+
   return (
     <>
       <div className="row gap wrap">
@@ -183,10 +238,100 @@ function ReviewTab({ run, client }: { run: RunSnapshot; client: EngineClient }) 
             {b}
           </label>
         ))}
+        <div className="seg small">
+          {([["", "All"], ["pending", "To decide"], ["approved", "Approved"], ["rejected", "Rejected"]] as [DecisionFilter, string][]).map(([v, l]) => (
+            <button key={v} className={filter === v ? "on" : ""} onClick={() => { setOffset(0); setFilter(v); }}>
+              {l}{counts && v ? ` (${counts[v]})` : ""}
+            </button>
+          ))}
+        </div>
         <input className="grow" placeholder="Search secured party / mapped name…" value={search}
           onChange={(e) => { setOffset(0); setSearch(e.target.value); }} />
       </div>
-      <DataTable page={page} cols={cols} offset={offset} limit={limit} setOffset={setOffset} />
+
+      <div className="row between wrap decision-bar">
+        <span className="small muted">
+          Approve a suggestion to add <em>SECP_NAME → mapped name (Firm ID)</em> to the updated master. Edit the mapped name first if the
+          suggestion is close but not right; the Firm ID is re-looked-up from the Universe.
+        </span>
+        <div className="row gap">
+          <button className="btn" disabled={busy !== "" || undecidedShown.length === 0}
+            onClick={() => decide(undecidedShown.map((r) => ({ key: str(r.key), decision: "approved" as Decision, mapped_name: edits[str(r.key)] })))}>
+            Approve all shown ({undecidedShown.length})
+          </button>
+          <button className="btn btn-primary" disabled={busy !== "" || !counts?.unapplied_approved} onClick={apply}>
+            {busy === "apply" ? "Adding…" : `Add ${counts?.unapplied_approved ?? 0} approved to updated master`}
+          </button>
+        </div>
+      </div>
+      {msg && <p className="small">{msg}</p>}
+
+      <div className="table-wrap">
+        <table className="table review">
+          <thead>
+            <tr>
+              <th>Secured party (as filed)</th><th>States</th><th>Suggested mapping</th><th>Method · score</th><th>Firm ID</th><th>Decision</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => {
+              const key = str(r.key);
+              const decision = r.decision as Decision | null;
+              const suggested = str(r.SECP_NAME_MAPPED);
+              const value = edits[key] ?? str(r.decided_mapped_name) ?? "";
+              return (
+                <tr key={key} className={decision ? `decided ${decision}` : ""}>
+                  <td title={str(r.SECP_NAME)}>
+                    <div className="cell-main">{str(r.SECP_NAME)}</div>
+                    {r.matched_master_raw ? <div className="muted small">master: {str(r.matched_master_raw)}</div> : null}
+                  </td>
+                  <td className="muted small">{str(r.DEBT_STATE)} → {str(r.SECP_STATE)}</td>
+                  <td>
+                    <input className="inline" value={value || suggested} placeholder={suggested}
+                      disabled={decision === "approved" || busy !== ""}
+                      onChange={(e) => { const v = e.target.value; setEdits((prev) => ({ ...prev, [key]: v })); }} />
+                    {r.decided_mapped_name ? <div className="small muted">suggested: {suggested}</div> : null}
+                  </td>
+                  <td className="small">
+                    <div>{str(r.match_method)}</div>
+                    <div className="muted">{num(r.match_score)} · {str(r.confidence).replace("REVIEW_", "")}</div>
+                  </td>
+                  <td className="small">
+                    {str(decision ? r.decided_firm_id : r.Firm_ID) || (
+                      <span className="muted" title={decision === "approved" ? "Corrected name not found in the Universe – Firm ID left blank" : undefined}>—</span>
+                    )}
+                  </td>
+                  <td>
+                    {decision ? (
+                      <div className="row gap">
+                        <span className={`pill ${decision}`}>{decision}</span>
+                        <button className="link small" disabled={busy !== ""} onClick={() => decide([{ key, decision: null }])}>undo</button>
+                      </div>
+                    ) : (
+                      <div className="row gap">
+                        <button className="btn ok" disabled={busy !== ""}
+                          onClick={() => decide([{ key, decision: "approved", mapped_name: edits[key] }])}>Approve</button>
+                        <button className="btn" disabled={busy !== ""} onClick={() => decide([{ key, decision: "rejected" }])}>Reject</button>
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+            {page && rows.length === 0 && <tr><td colSpan={6} className="muted">No rows.</td></tr>}
+            {!page && <tr><td colSpan={6} className="muted">Loading…</td></tr>}
+          </tbody>
+        </table>
+      </div>
+      {page && (
+        <div className="row between small">
+          <span className="muted">{page.total.toLocaleString()} rows · showing {Math.min(offset + 1, page.total)}–{Math.min(offset + limit, page.total)}</span>
+          <div className="row gap">
+            <button className="btn" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - limit))}>‹ Prev</button>
+            <button className="btn" disabled={offset + limit >= page.total} onClick={() => setOffset(offset + limit)}>Next ›</button>
+          </div>
+        </div>
+      )}
     </>
   );
 }

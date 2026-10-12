@@ -150,6 +150,95 @@ def test_clustering_stages_are_skipped_by_default_but_keep_the_dag_wired():
     assert out.attrs == {} and df.attrs  # input untouched, output carries no model handle
 
 
+def _fake_finished_run(tmp_path: Path):
+    """A succeeded run with an in-memory results frame + updated master, no models involved."""
+    from ucc_engine.config import PipelineConfig
+    from ucc_engine.datasources import CsvSourceSpec
+    from ucc_engine.runner import PipelineRun
+
+    universe = tmp_path / "universe.csv"
+    universe.write_text("Bank Name,Firm ID\nAcme Bank,101\nZeta Bank,202\n")
+    spec = CsvSourceSpec(ucc_path=str(tmp_path / "u.csv"), master_path=str(tmp_path / "m.csv"), universe_path=str(universe))
+    run = PipelineRun(spec, PipelineConfig(), runs_root=tmp_path / "runs", name="t")
+    run.config.universe_file = str(universe)
+    run.status = "succeeded"
+    results = pd.DataFrame({
+        "DEBT_STATE": ["ca", "NY", "TX", "FL"], "SECP_STATE": ["CA", "NY", "TX", "FL"],
+        "SECP_NAME": ["ACME BK NA", "ZETA BANK TRUSTEE", "OTHER CO", "KNOWN"],
+        "SECP_NAME_MAPPED": ["Acme Bank", "Zeta Bank", "Unknown Co", "Known"],
+        "match_method": ["Advanced Match"] * 3 + ["Exact Match (Raw)"],
+        "match_score": [0.91, 0.88, 0.86, 1.0],
+        "confidence": ["REVIEW_HIGH", "REVIEW_MEDIUM", "REVIEW_LOW", "AUTO"],
+        "Firm_ID": [101, None, None, 5],
+    })
+    run._cache["universe_enriched_results"] = results
+    master = pd.DataFrame({"DEBT_STATE": ["FL"], "SECP_STATE": ["FL"], "SECP_NAME": ["KNOWN"],
+                           "SECP_NAME_MAPPED": ["Known"], "Firm ID": [5], "_source": ["original_master"]})
+    run._cache["updated_master_data"] = master
+    run.output_dir.mkdir(parents=True, exist_ok=True)
+    master.drop(columns="_source").to_csv(run.output_dir / "updated_master_20260101_000000.csv", index=False)
+    master.to_csv(run.output_dir / "updated_master_20260101_000000_with_source.csv", index=False)
+    run.summary = run._build_summary()
+    return run
+
+
+def test_review_decisions_flow_into_updated_master(tmp_path: Path):
+    from ucc_engine.runner import PipelineRun
+
+    run = _fake_finished_run(tmp_path)
+    page = run.review()
+    assert page["total"] == 3 and all("key" in r and r["decision"] is None for r in page["rows"])
+    k_acme, k_other, k_zeta = (r["key"] for r in sorted(page["rows"], key=lambda r: r["SECP_NAME"]))
+    assert k_acme == "CA|CA|ACME BK NA"  # states normalised like the core
+
+    # approve as suggested, approve with a corrected name (Firm ID re-resolved from the Universe), reject one
+    out = run.set_decisions([
+        {"key": k_acme, "decision": "approved"},
+        {"key": k_other, "decision": "approved", "mapped_name": "Zeta Bank"},
+        {"key": k_zeta, "decision": "rejected"},
+    ])
+    assert out["counts"] == {"approved": 2, "rejected": 1, "pending": 0, "applied": 0, "unapplied_approved": 2}
+    assert run.decisions[k_other]["firm_id"] == 202 and run.decisions[k_acme]["firm_id"] == 101
+    assert run.review(decision="approved")["total"] == 2 and run.review(decision="pending")["total"] == 0
+    with pytest.raises(KeyError):
+        run.set_decisions([{"key": "FL|FL|KNOWN", "decision": "approved"}])  # AUTO row is not reviewable
+    with pytest.raises(ValueError):
+        run.set_decisions([{"key": k_acme, "decision": "maybe"}])
+
+    # promote applies pending approvals first; the promoted file contains exactly master + approved rows
+    dest = tmp_path / "Master Mapping.csv"
+    dest.write_text("x\n")
+    res = run.promote_master(str(dest))
+    promoted = pd.read_csv(dest)
+    assert list(promoted.columns) == ["DEBT_STATE", "SECP_STATE", "SECP_NAME", "SECP_NAME_MAPPED", "Firm ID"]
+    assert promoted["SECP_NAME"].tolist() == ["KNOWN", "ACME BK NA", "OTHER CO"]
+    assert promoted.set_index("SECP_NAME").loc["OTHER CO", "SECP_NAME_MAPPED"] == "Zeta Bank"
+    assert promoted["Firm ID"].tolist() == [5, 101, 202]
+    assert res["backup"] and Path(res["backup"]).read_text() == "x\n"
+    assert run.decision_counts()["unapplied_approved"] == 0 and run.summary["updated_master"]["approved_rows"] == 2
+
+    # re-applying is idempotent (no duplicate approved rows), and decisions survive a restart
+    run.apply_decisions()
+    latest = pd.read_csv(run._latest("updated_master_*.csv", exclude="_with_source"))
+    assert len(latest) == 3
+    run._persist()
+    restored = PipelineRun.load(run.run_dir)
+    assert restored is not None and restored.decisions.keys() == run.decisions.keys()
+
+    # clearing a decision
+    run.set_decisions([{"key": k_zeta, "decision": None}])
+    assert run.decision_counts()["pending"] == 1
+
+    # a corrected name that is not in the Universe gets a blank Firm ID (not the suggestion's),
+    # and the blank must not demote the column to floats ("101.0") in the CSV
+    run.set_decisions([{"key": k_zeta, "decision": "approved", "mapped_name": "Unknown Bank"}])
+    assert run.decisions[k_zeta]["firm_id"] is None
+    run.apply_decisions()
+    text = Path(run._latest("updated_master_*.csv", exclude="_with_source")).read_text()
+    assert ",101\n" in text and ".0" not in text
+    assert any(line.endswith(",Unknown Bank,") for line in text.splitlines())
+
+
 def test_api_health_and_validation(tmp_path: Path):
     from fastapi.testclient import TestClient
 

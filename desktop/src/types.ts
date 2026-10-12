@@ -28,7 +28,7 @@ export interface Summary {
   avg_cluster_size: number;
   records_with_firm_id: number;
   unique_firm_ids: number;
-  updated_master?: { rows: number; original_rows: number; added_rows: number; file: string | null };
+  updated_master?: { rows: number; original_rows: number; added_rows: number; approved_rows?: number; file: string | null };
   lead_bank?: { rows: number; columns: string[] };
   stage_seconds: Record<string, number>;
   total_seconds: number;
@@ -68,6 +68,31 @@ export interface Page {
   limit: number;
   columns?: string[];
   rows: Record<string, unknown>[];
+  decision_counts?: DecisionCounts;
+}
+
+export type Decision = "approved" | "rejected";
+
+export interface DecisionCounts {
+  approved: number;
+  rejected: number;
+  pending: number;
+  applied: number;
+  unapplied_approved: number;
+}
+
+export interface DecisionItem {
+  key: string;
+  decision: Decision | null;
+  mapped_name?: string | null;
+}
+
+export interface ApplyResult {
+  approved: number;
+  added: number;
+  file: string;
+  rows: number;
+  counts: DecisionCounts;
 }
 
 export interface OutputFile {

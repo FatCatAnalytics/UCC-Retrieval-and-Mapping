@@ -59,11 +59,24 @@ lead-bank files) and `run.json` (status, timings, summary, log tail).
 | `GET /runs/{id}/logs?after=N` | incremental log lines |
 | `POST /runs/{id}/cancel` | stop after the current stage |
 | `GET /runs/{id}/summary` | the numbers from the Dagster summary file, as JSON |
-| `GET /runs/{id}/review` | paged review queue (`confidence`, `search`, `method`, `offset`, `limit`) |
+| `GET /runs/{id}/review` | paged review queue (`confidence`, `search`, `method`, `decision` = `pending`/`approved`/`rejected`, `offset`, `limit`); each row carries its `key` and current decision |
+| `GET/PUT /runs/{id}/decisions` | read / record review decisions: `{items: [{key, decision: "approved"\|"rejected"\|null, mapped_name?, firm_id?}]}` |
+| `POST /runs/{id}/apply-decisions` | append approved rows to a fresh `updated_master_<ts>.csv` (`_source = reviewed_approved`) |
 | `GET /runs/{id}/clusters` | new-entity clusters, one row per cluster |
 | `GET /runs/{id}/outputs[/{name}]` | list / download output files |
-| `POST /runs/{id}/promote-master` | copy this run's `updated_master` over a destination (timestamped backup kept) |
+| `POST /runs/{id}/promote-master` | apply any pending approvals, then copy this run's `updated_master` over a destination (timestamped backup kept) |
 | `DELETE /runs/{id}` | remove a finished run |
+
+### Reviewing suggestions
+
+Rows in the `REVIEW_*` confidence bands are suggestions, not facts, so they are
+*not* added to the updated master automatically. The reviewer approves (optionally
+after correcting the mapped name), rejects, or leaves them pending; decisions are
+keyed by `DEBT_STATE|SECP_STATE|SECP_NAME` and persisted in the run's
+`decisions.json`, so they survive an engine restart. Approving writes
+`SECP_NAME → mapped name (Firm ID)`; the Firm ID is looked up in the Universe by
+the final mapped name and left blank if that name is unknown. Original master and
+pipeline (Stage 1–3) rows always win over an approved row with the same key.
 
 ## Configuration
 

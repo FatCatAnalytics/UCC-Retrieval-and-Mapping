@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Health, LogLine, OutputFile, Page, RunSnapshot, SourcePreview, SourceSpec, Summary } from "./types";
+import type {
+  ApplyResult, DecisionCounts, DecisionItem, Health, LogLine, OutputFile, Page, RunSnapshot, SourcePreview, SourceSpec, Summary,
+} from "./types";
 
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -69,11 +71,12 @@ export class EngineClient {
   summary = (id: string) => this.req<Summary>(`/runs/${id}/summary`);
   outputs = (id: string) => this.req<OutputFile[]>(`/runs/${id}/outputs`);
 
-  review = (id: string, q: { confidence?: string[]; search?: string; method?: string; offset?: number; limit?: number }) => {
+  review = (id: string, q: { confidence?: string[]; search?: string; method?: string; decision?: string; offset?: number; limit?: number }) => {
     const p = new URLSearchParams();
     (q.confidence ?? []).forEach((c) => p.append("confidence", c));
     if (q.search) p.set("search", q.search);
     if (q.method) p.set("method", q.method);
+    if (q.decision) p.set("decision", q.decision);
     p.set("offset", String(q.offset ?? 0));
     p.set("limit", String(q.limit ?? 100));
     return this.req<Page>(`/runs/${id}/review?${p}`);
@@ -87,6 +90,11 @@ export class EngineClient {
     p.set("limit", String(q.limit ?? 100));
     return this.req<Page>(`/runs/${id}/clusters?${p}`);
   };
+
+  decisions = (id: string) => this.req<{ counts: DecisionCounts; decisions: Record<string, unknown> }>(`/runs/${id}/decisions`);
+  setDecisions = (id: string, items: DecisionItem[]) =>
+    this.req<{ changed: number; counts: DecisionCounts }>(`/runs/${id}/decisions`, { method: "PUT", body: JSON.stringify({ items }) });
+  applyDecisions = (id: string) => this.req<ApplyResult>(`/runs/${id}/apply-decisions`, { method: "POST" });
 
   promoteMaster = (id: string, destination: string) =>
     this.req<{ source: string; destination: string; backup: string | null }>(`/runs/${id}/promote-master`, {

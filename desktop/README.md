@@ -10,10 +10,13 @@ Tauri 2 shell (Rust) + React/TypeScript UI around the Python engine in
 2. **Run** - the 17 stages with live status/timings and the streamed log;
    cancel after the current stage.
 3. **Results** - summary (auto / review / new entities / Firm-ID coverage,
-   match-method and confidence breakdowns, stage timings), the review queue
-   and new-entity clusters as searchable tables, the output files, and
-   **Promote as new master** (copies the run's `updated_master_*.csv` over your
-   Master Mapping file, keeping a timestamped backup).
+   match-method and confidence breakdowns, stage timings), the **review queue**
+   where you approve, correct-then-approve, or reject each suggestion (approved
+   rows are appended to the updated master with **Add N approved to updated
+   master**; decisions persist per run), new-entity clusters when clustering is
+   on, the output files, and **Promote as new master** (applies pending approvals,
+   then copies the run's `updated_master_*.csv` over your Master Mapping file,
+   keeping a timestamped backup).
 
 No LLM and no network inference: the two small models run on the local CPU.
 

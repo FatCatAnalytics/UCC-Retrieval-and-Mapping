@@ -91,6 +91,31 @@ input:focus, textarea:focus { outline: 2px solid color-mix(in srgb, var(--accent
 .tabs button.on { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
 .chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border: 1px solid var(--line); border-radius: 999px; font-size: 12px; }
 .chip input { width: auto; }
+.seg.small button { padding: 5px 10px; font-size: 12px; }
+.decision-bar { margin: 12px 0 8px; gap: 12px; }
+.decision-bar > span { max-width: 560px; }
+.btn.ok { color: var(--good); border-color: var(--good); }
+.btn.ok:hover { background: color-mix(in srgb, var(--good) 10%, transparent); }
+.pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }
+.pill.approved { background: color-mix(in srgb, var(--good) 14%, transparent); color: var(--good); }
+.pill.rejected { background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+.table.review { table-layout: fixed; }
+.table.review td { vertical-align: top; }
+.table.review th, .table.review td { padding: 8px; }
+.table.review th:nth-child(1) { width: 25%; }
+.table.review th:nth-child(2) { width: 68px; }
+.table.review th:nth-child(3) { width: 23%; }
+.table.review th:nth-child(5) { width: 60px; }
+.table.review th:nth-child(6) { width: 172px; }
+.table.review td:last-child { overflow: visible; }
+.table.review .cell-main, .table.review .muted.small { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.table.review .inline { width: 100%; min-width: 0; padding: 5px 8px; font: inherit; font-size: 12.5px; border: 1px solid transparent; border-radius: 6px; background: transparent; }
+.table.review .inline:hover:not(:disabled), .table.review .inline:focus { border-color: var(--line); background: var(--bg); }
+.table.review .inline:disabled { color: var(--text); }
+.table.review tr.decided.approved { background: color-mix(in srgb, var(--good) 5%, transparent); }
+.table.review tr.decided.rejected { opacity: .55; }
+.cell-main { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.link.small { font-size: 12px; }
 .alert { background: color-mix(in srgb, var(--bad) 12%, transparent); border: 1px solid var(--bad); color: var(--bad); border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; font-family: var(--mono); font-size: 12px; }
 
 .progress { height: 8px; background: var(--bg); border-radius: 999px; overflow: hidden; }
