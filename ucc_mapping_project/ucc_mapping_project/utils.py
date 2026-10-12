@@ -14,7 +14,14 @@ from .constants import (
     ROLE_RE,
     COMMON_WORDS,
     ABBREVIATIONS,
-    ENTITY_TYPE_PATTERNS
+    ENTITY_TYPE_PATTERNS,
+    PARENTHETICAL_RE,
+    DIVISION_OF_RE,
+    RECEIVER_OF_RE,
+    PREDECESSOR_TAIL_RE,
+    CAPACITY_TAIL_RE,
+    CHARTER_MID_RE,
+    BRANCH_TAIL_RE,
 )
 
 # =============================================================================
@@ -75,13 +82,50 @@ ACRONYM_SKIP_WORDS = frozenset({'THE', 'OF', 'AND', 'A', 'AN', 'IN', 'FOR', 'TO'
 _CACHE_SIZE = 200_000
 
 
+@lru_cache(maxsize=_CACHE_SIZE)
+def pre_clean_name(name: str) -> str:
+    """Reduce a filed secured-party string to the one lender it names.
+
+    Order matters: pick the lender out of two-name phrases first, then cut the
+    capacity / predecessor / branch tails, then drop charter words. Each step
+    is a no-op when its pattern is absent. Examples:
+
+        STARION BANK (LENDER AND LETTER OF CREDIT ISSUER)        -> STARION BANK
+        KEY EQUIPMENT FINANCE, A DIVISION OF KEYBANK NA          -> KEYBANK
+        FDIC AS RECEIVER OF FIRST REPUBLIC BANK, SAN FRANCISCO   -> FIRST REPUBLIC BANK
+        TD BANK, NA, AS SUCCESSOR BY MERGER TO MERCANTILE BANK   -> TD BANK
+        WELLS FARGO BANK, N.A., AS ADMINISTRIVE AGENT            -> WELLS FARGO BANK
+        PLAINSCAPITAL BANK, A TEXAS STATE BANKING ASSOCIATION    -> PLAINSCAPITAL BANK
+        PARK BANK- BROOKFIELD                                    -> PARK BANK
+    """
+    s = str(name).upper().strip()
+    if not s:
+        return ""
+    s = PARENTHETICAL_RE.sub(" ", s)
+    m = DIVISION_OF_RE.match(s)
+    if m:
+        s = s[m.end():]
+    m = RECEIVER_OF_RE.match(s)
+    if m:
+        s = s[m.end():].split(",", 1)[0]
+    s = PREDECESSOR_TAIL_RE.sub("", s)
+    s = CAPACITY_TAIL_RE.sub("", s)
+    s = BRANCH_TAIL_RE.sub(r"\1", s)
+    s = CHARTER_MID_RE.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip(" ,;:-")
+    # Never clean a name down to nothing - fall back to the raw string.
+    return s if re.search(r"[A-Z0-9]", s) else str(name).upper().strip()
+
+
 def normalize_name(name: str) -> str:
     """Normalize SECP_NAME for better matching."""
     if pd.isna(name) or not str(name).strip():
         return ""
     
-    name = str(name).upper().strip()
-    
+    name = pre_clean_name(str(name))
+    if not name:
+        return ""
+
     # Strip role qualifiers first (e.g. "as trustee", "as agent")
     m = ROLE_RE.search(name)
     if m:
@@ -517,6 +561,15 @@ def combined_fuzzy_score(name1: str, name2: str) -> float:
     if token_set > 90 and ratio < 70:
         # Token set is giving false confidence due to shared common words
         score *= 0.6
+
+    # GUARDRAIL 6: Same words, different order. Bank names are order-sensitive
+    # ("NATIONAL CITY BANK" is PNC, "CITY NATIONAL BANK" is RBC) but token_sort
+    # and token_set score such pairs 100, so the ensemble reaches ~90 on
+    # order-insensitive measures alone. Push them below the review floor; the
+    # embedding stage still sees them.
+    tokens1, tokens2 = name1.split(), name2.split()
+    if tokens1 != tokens2 and sorted(tokens1) == sorted(tokens2):
+        score *= 0.93
 
     return score
 

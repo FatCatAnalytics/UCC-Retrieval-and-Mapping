@@ -315,7 +315,155 @@ def test_api_health_and_validation(tmp_path: Path):
     assert client.get("/decisions").json()["total"] == 0
     assert client.post("/decisions/clear", json={"keys": ["X|X|NOPE"]}).json()["cleared"] == 0
     assert client.get("/decisions/export").headers["content-type"].startswith("text/csv")
-    assert client.get("/config/defaults").json()["defaults"]["fuzzy_auto_threshold"] == 96
+    assert client.get("/config/defaults").json()["defaults"]["fuzzy_auto_threshold"] == 90
     assert client.get("/runs/nope").status_code == 404
     r = client.post("/runs", json={"source": {"type": "csv", "ucc_path": "/nope.csv", "master_path": "/nope2.csv"}, "sample_rows": -1})
     assert r.status_code == 422  # sample_rows must be >= 0
+
+
+def test_bucket_classification_and_rows_endpoint(tmp_path: Path):
+    """Every result row lands in exactly one of the four pipeline buckets, and the
+    /runs/{id}/rows endpoint pages them."""
+    from ucc_engine.runner import BUCKETS, bucket_series
+
+    df = pd.DataFrame({
+        "DEBT_STATE": ["CA"] * 6, "SECP_STATE": ["CA"] * 6,
+        "SECP_NAME": ["A", "B", "C", "D", "E", "F"],
+        "SECP_NAME_MAPPED": ["A", "B", "C", "D", None, None],
+        "match_method": ["Exact Match (Raw)", "Exact Match (Normalized)", "Fuzzy Match", "Advanced Match", None, "No Master State Pair"],
+        "confidence": ["AUTO", "AUTO", "AUTO", "REVIEW_HIGH", "NEW_ENTITY", None],
+        "match_score": [1.0, 1.0, 0.97, 0.91, None, None],
+    })
+    b = bucket_series(df)
+    assert list(b) == ["direct", "direct", "fuzzy_high", "review", "unmatched", "unmatched"]
+    assert set(b.unique()) <= set(BUCKETS)
+
+    # Ambiguous exact matches are suggestions, not facts -> review.
+    amb = df.iloc[[0]].copy()
+    amb["match_method"], amb["confidence"] = "Exact Match (Raw - State Ambiguous)", "REVIEW_HIGH"
+    assert list(bucket_series(amb)) == ["review"]
+
+    # summary + paging on a fake finished run
+    run = _fake_finished_run(tmp_path)
+    assert run.summary["buckets"] == {"direct": 1, "fuzzy_high": 0, "review": 3, "unmatched": 0}
+    assert run.summary["review_bands"] == {"REVIEW_HIGH": 1, "REVIEW_MEDIUM": 1, "REVIEW_LOW": 1}
+    page = run.rows(bucket="direct")
+    assert page["total"] == 1 and page["rows"][0]["SECP_NAME"] == "KNOWN"
+    assert run.rows(bucket="review", search="zeta")["total"] == 1
+    with pytest.raises(KeyError):
+        run.rows(bucket="nope")
+
+
+def test_models_are_copied_from_the_network_share(tmp_path: Path):
+    """model_share_dir: files missing/newer on the share are copied into the local
+    model folder; up-to-date files are left alone; an unreachable share is fine
+    once the local copy exists."""
+    import os
+    import time
+    from ucc_engine.model_sync import sync_models_from_share, sync_status
+
+    share = tmp_path / "share"
+    (share / "models--Qdrant--bge-small-en-v1.5-onnx-Q" / "snapshots" / "abc").mkdir(parents=True)
+    (share / "models--Qdrant--bge-small-en-v1.5-onnx-Q" / "snapshots" / "abc" / "model.onnx").write_bytes(b"x" * 1000)
+    (share / "models--Xenova--ms-marco-MiniLM-L-6-v2").mkdir()
+    (share / "models--Xenova--ms-marco-MiniLM-L-6-v2" / "config.json").write_text("{}")
+    (share / "unrelated.txt").write_text("ignored")
+    local = tmp_path / "local"
+
+    r = sync_models_from_share(str(share), str(local))
+    assert r["status"] == "updated" and r["copied"] == 2 and r["bytes"] == 1002
+    assert (local / "models--Qdrant--bge-small-en-v1.5-onnx-Q" / "snapshots" / "abc" / "model.onnx").read_bytes() == b"x" * 1000
+    assert not (local / "unrelated.txt").exists()
+
+    # second pass: nothing to do
+    assert sync_models_from_share(str(share), str(local))["status"] == "up_to_date"
+
+    # a newer file on the share is re-copied
+    time.sleep(0.01)
+    f = share / "models--Xenova--ms-marco-MiniLM-L-6-v2" / "config.json"
+    f.write_text('{"v": 2}')
+    os.utime(f, (time.time() + 5, time.time() + 5))
+    r = sync_models_from_share(str(share), str(local))
+    assert r["copied"] == 1 and (local / "models--Xenova--ms-marco-MiniLM-L-6-v2" / "config.json").read_text() == '{"v": 2}'
+
+    st = sync_status(str(share), str(local))
+    assert st["share_reachable"] and len(st["local_models"]) == 2 and st["last_synced"]
+
+    # share gone: keep going on the local copy; share gone and nothing local: hard error
+    assert sync_models_from_share(str(tmp_path / "nope"), str(local))["status"] == "share_unreachable"
+    with pytest.raises(FileNotFoundError):
+        sync_models_from_share(str(tmp_path / "nope"), str(tmp_path / "empty"))
+
+    # the loader resolves to the local copy in offline mode
+    from ucc_engine.config import PipelineConfig
+    from ucc_engine.embeddings import model_location
+    cfg = PipelineConfig(model_share_dir=str(share), model_cache_dir=str(local))
+    assert model_location(cfg) == (str(local), str(local))
+    assert model_location(PipelineConfig(model_dir=str(share), model_cache_dir=str(local))) == (str(local), str(share))
+
+
+def test_decisions_propagate_across_state_pairs_and_spellings(tmp_path: Path):
+    """One decision on a filer name covers its other state pairs and spelling variants
+    when the suggested bank is the same; a different suggested bank stays pending."""
+    from ucc_engine.config import PipelineConfig
+    from ucc_engine.datasources import CsvSourceSpec
+    from ucc_engine.runner import PipelineRun
+
+    universe = tmp_path / "universe.csv"
+    universe.write_text("Bank Name,Firm ID\nWells Fargo,1\nPinnacle Bank (GA),2\nPinnacle Bank (NE),3\n")
+    spec = CsvSourceSpec(ucc_path=str(tmp_path / "u.csv"), master_path=str(tmp_path / "m.csv"), universe_path=str(universe))
+    run = PipelineRun(spec, PipelineConfig(), runs_root=tmp_path / "runs", name="p")
+    run.config.universe_file = str(universe)
+    run.status = "succeeded"
+    results = pd.DataFrame({
+        "DEBT_STATE": ["CA", "TX", "NY", "GA", "NE", "CA"],
+        "SECP_STATE": ["SD", "SD", "SD", "GA", "NE", "SD"],
+        "SECP_NAME": [
+            "WELLS FARGO BANK, N.A., AS ADMINISTRIVE AGENT",   # decided by the reviewer
+            "WELLS FARGO BANK, NATIONAL ASSOCIATION, AS AGENT",  # same filer, other state pair -> inherits
+            "WELLS FARGO BANK NA",                               # spelling variant -> inherits
+            "PINNACLE BANK", "PINNACLE BANK",                    # same name, DIFFERENT suggested banks
+            "WELLS FARGO BANK, N.A., AS ADMINISTRIVE AGENT",     # a second filing of the first key (dedup)
+        ],
+        "SECP_NAME_MAPPED": ["Wells Fargo", "Wells Fargo", "Wells Fargo", "Pinnacle Bank (GA)", "Pinnacle Bank (NE)", "Wells Fargo"],
+        "match_method": ["Advanced Match"] * 6, "match_score": [0.9] * 6,
+        "confidence": ["REVIEW_HIGH"] * 6, "Firm_ID": [1, 1, 1, 2, 3, 1],
+    })
+    run._cache["universe_enriched_results"] = results
+    master = pd.DataFrame({"DEBT_STATE": ["FL"], "SECP_STATE": ["FL"], "SECP_NAME": ["KNOWN"],
+                           "SECP_NAME_MAPPED": ["Known"], "Firm ID": [5], "_source": ["original_master"]})
+    run._cache["updated_master_data"] = master
+    run.output_dir.mkdir(parents=True, exist_ok=True)
+    master.to_csv(run.output_dir / "updated_master_20260101_000000_with_source.csv", index=False)
+    run.summary = run._build_summary()
+
+    page = run.review()
+    assert page["total"] == 5, "review rows are one per key"
+    first = next(r for r in page["rows"] if r["DEBT_STATE"] == "CA")
+    assert first["filings"] == 2
+
+    out = run.set_decisions([{"key": first["key"], "decision": "approved"}])
+    assert out["changed"] == 1 and out["inherited"] == {"approved": 2, "rejected": 0, "candidates": 2}
+    rows = {r["DEBT_STATE"]: r for r in run.review()["rows"]}
+    assert rows["TX"]["decision"] == "approved" and rows["TX"]["decision_source"].startswith("inherited:")
+    assert rows["NY"]["decision"] == "approved"
+    assert rows["GA"]["decision"] is None and rows["NE"]["decision"] is None  # pending is null on the wire
+
+    # the two PINNACLE rows suggest different banks: approving one must not decide the other
+    run.set_decisions([{"key": rows["GA"]["key"], "decision": "approved"}])
+    rows = {r["DEBT_STATE"]: r for r in run.review()["rows"]}
+    assert rows["GA"]["decision"] == "approved" and rows["NE"]["decision"] is None
+
+    # groups roll up by bank, biggest first
+    groups = run.review_groups(decision="")
+    assert [g["mapped_name"] for g in groups][:1] == ["Wells Fargo"]
+    wf = groups[0]
+    assert wf["keys"] == 3 and wf["filings"] == 4 and wf["approved"] == 3
+    assert run.review(mapped="Wells Fargo")["total"] == 3
+
+    # inherited approvals are real decisions: they reach the updated master and can be undone per key
+    res = run.apply_decisions()
+    assert res["added"] == 4
+    run.set_decisions([{"key": rows["TX"]["key"], "decision": None}])
+    assert {r["DEBT_STATE"]: r["decision"] for r in run.review()["rows"]}["TX"] is None
+    assert [h["action"] for h in run.decisions.history(rows["NY"]["key"])][-1].startswith("approved (inherited:")

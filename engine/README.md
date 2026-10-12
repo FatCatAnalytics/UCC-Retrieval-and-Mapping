@@ -52,13 +52,18 @@ lead-bank files) and `run.json` (status, timings, summary, log tail).
 |---|---|
 | `GET /health` | version, available backends, active run |
 | `GET /config/defaults` | `PipelineConfig` defaults + schema for a settings form |
-| `POST /models/prefetch` | download models now |
+| `POST /models/prefetch` | download models now (or, with `model_share_dir`, copy them from the share) |
+| `GET /models/status` | is the network model share reachable, what is local, when last copied |
+| `POST /models/sync` | copy the models from `model_share_dir` into the local model folder now |
 | `POST /sources/preview` | validate a CSV/SQL source: columns present/missing, row counts, 5-row preview |
 | `GET/POST /runs` | list runs / start one `{source, config, sample_rows, name}` (409 if one is running) |
 | `GET /runs/{id}` | status, progress (0-1), per-stage state, summary |
 | `GET /runs/{id}/logs?after=N` | incremental log lines |
 | `POST /runs/{id}/cancel` | stop after the current stage |
 | `GET /runs/{id}/summary` | the numbers from the Dagster summary file, as JSON |
+| `GET /runs/{id}/rows?bucket=` | read-only page of one result bucket: `direct` / `fuzzy_high` / `review` / `unmatched` (the summary carries the counts under `buckets`) |
+| `GET /runs/{id}/review/groups` | the review queue rolled up by suggested bank (`decision`, `search`) |
+| `POST /runs/{id}/propagate-decisions` | inherit decisions made on the same filer name elsewhere |
 | `GET /runs/{id}/review` | paged review queue (`confidence`, `search`, `method`, `decision` = `pending`/`approved`/`rejected`, `offset`, `limit`); each row carries its `key` and current decision |
 | `GET/PUT /runs/{id}/decisions` | read / record review decisions: `{items: [{key, decision: "approved"\|"rejected"\|null, mapped_name?, firm_id?}]}` |
 | `POST /runs/{id}/apply-decisions` | append approved rows to a fresh `updated_master_<ts>.csv` (`_source = reviewed_approved`) |
@@ -94,8 +99,53 @@ database shared by every run, `<engine home>/decisions.sqlite` (tables
   in the Universe by the final mapped name and left blank if that name is
   unknown. Original master and pipeline (Stage 1–3) rows always win over an
   approved row with the same key.
+- **Decisions propagate.** A decision on a filer name is inherited by every
+  pending row with the same *normalised* name (other state pairs, spelling
+  variants, later runs) **when the suggested bank is the same bank**; a row
+  suggesting a different bank stays pending (so `PINNACLE BANK` in GA does not
+  inherit an approval for Pinnacle Bank (NE)). Inherited decisions are written
+  per key with `source = inherited:<origin key>`, show as *approved · inherited*,
+  flow into the updated master like any approval, and can be undone per key -
+  an undone key is never re-inherited. Propagation runs after every decision,
+  at the end of every run, and on `POST /runs/{id}/propagate-decisions`.
+- Review rows are one per key (`filings` carries how many filings share it);
+  `GET /runs/{id}/review/groups` rolls the queue up by suggested bank, biggest
+  first, and `review?mapped=<bank>` pages one bank's rows - the desktop app's
+  *By bank* view approves a whole block at once.
 - A per-run `decisions.json` from older engine versions is imported into the
   database the first time the run is loaded (renamed `.json.imported`).
+
+## Matching quality
+
+`tests/test_match_quality.py` is a hold-out test on the real Master Mapping:
+1,500 known rows are removed and their raw names fed back through the Stage 3
+logic against the rest. It asserts floors on precision / recall at the auto
+threshold, so a change to `normalize_name`, the guardrails or the thresholds
+is measured rather than guessed. Baseline (2026-10-12, seed 42):
+
+| | precision @ auto | recall @ auto | recall, any score |
+|---|---|---|---|
+| before (`fuzzy_auto_threshold=96`, old normaliser) | 0.990 | 0.551 | 0.856 |
+| now (`=90`, pre-clean normaliser, order guardrail) | 0.990 | 0.719 | 0.867 |
+
+What changed, and why (all in `ucc_mapping_project/.../utils.py` + `constants.py`,
+synced into `core/`):
+
+* `pre_clean_name()` runs before normalisation: drops parentheticals, picks the
+  lender out of "X, A DIVISION OF Y" / "FDIC AS RECEIVER OF Y", keeps the current
+  entity in "X, SUCCESSOR BY MERGER TO Y" / "X F/K/A Y" / "X DBA Y", cuts
+  capacity tails the role regex missed ("AS ADMINISTRIVE AGENT", ", A TEXAS STATE
+  BANKING ASSOCIATION", "NOT IN ITS INDIVIDUAL CAPACITY ..."), strips branch
+  qualifiers ("PARK BANK- BROOKFIELD") and mid-string charter words (N.A., FSB).
+* Guardrail 6 in `combined_fuzzy_score`: same words in a different order
+  ("NATIONAL CITY BANK" vs "CITY NATIONAL BANK") no longer reach the review floor
+  on fuzzy alone.
+* `fuzzy_auto_threshold` 96 → 90: precision is flat between the two on the
+  hold-out; recall rises.
+* `advanced_cross_encoder_promote_to_auto` 0.92 → 1.01: the reranker is
+  review-only. In the June 2026 run it had promoted 983 REVIEW_MEDIUM names to
+  AUTO and a hand-labelled sample put ~25% of them on the wrong bank. Those rows
+  now land in the review queue (decisions are remembered across runs).
 
 ## Configuration
 
@@ -107,7 +157,8 @@ field-for-field (thresholds, clustering, performance, lead-bank, rerank), plus:
 | `clustering_enabled` | `false` | run Stages 5-7 (cluster unmatched rows, suggest a mapping per cluster). Off: unmatched rows are still labelled `NEW_ENTITY` and exported, without cluster columns; the stages show as *skipped* |
 | `embedding_backend` | `auto` | `fastembed` if installed, else `sentence-transformers` |
 | `embedding_model` | `BAAI/bge-small-en-v1.5` | 384-dim; keep in sync with any persisted query cache |
-| `model_dir` | `""` | offline model folder - local path **or network share / UNC path** - holding both models; when set nothing is downloaded (see below) |
+| `model_dir` | `""` | read the models *in place* from this folder (local path or network share); when set nothing is downloaded or copied |
+| `model_share_dir` | `""` | network share holding both models; anything missing or newer is **copied** into `model_cache_dir` before the first load, then the local copy is used offline (see below) |
 | `model_cache_dir` | `<app data>/models` | where models are downloaded when `model_dir` is not set |
 | `model_threads` | `0` | ONNX / torch intra-op threads (0 = library default) |
 
@@ -128,7 +179,21 @@ server and no network inference. Options:
 1. **Default** - downloaded on first use (or via *Prepare models*) into
    `model_cache_dir` (`%LOCALAPPDATA%\ucc-engine\models` on Windows,
    `~/Library/Application Support/ucc-engine/models` on macOS). Needs internet once per PC.
-2. **Network share** - run once, from any machine with internet:
+2. **Network share, copied to each PC (recommended)** - prepare the share once,
+   from any machine with internet:
+
+   ```bash
+   ucc-engine prefetch-models --set "model_cache_dir=\\\\fileserver\\apps\\ucc-models"
+   ```
+
+   then set `model_share_dir` to that path on every PC (the *Network model
+   folder* on the app's Ingest panel, or `--set model_share_dir=...`). The
+   engine mirrors the `models--*` folders into the local `model_cache_dir`
+   (`ucc-engine sync-models --share ...` does it on demand); files are
+   re-copied only when the share has a newer / different-size version, and a
+   PC that already has the files keeps working when the share is unreachable.
+   ~150 MB crosses the LAN once per PC, not once per session.
+3. **Network share, read in place** - run once, from any machine with internet:
 
    ```bash
    ucc-engine prefetch-models --set "model_cache_dir=\\\\fileserver\\apps\\ucc-models"
@@ -137,8 +202,8 @@ server and no network inference. Options:
    then set `model_dir` to that path on every PC (advanced settings in the app,
    or `--set model_dir=...`). Files are only read; ~150 MB crosses the LAN per
    app session, the share can be read-only, and no PC needs internet.
-3. **Share as distribution point** - copy that folder to each PC's
-   `model_cache_dir` (login script / installer) for the fastest start.
+4. **Share as distribution point** - copy that folder to each PC's
+   `model_cache_dir` yourself (login script / installer); same result as 2.
 
 The folder layout is fastembed's cache layout (`models--Qdrant--bge-small-en-v1.5-onnx-Q/`,
 `models--Xenova--ms-marco-MiniLM-L-6-v2/`); `prefetch-models` writes exactly that.

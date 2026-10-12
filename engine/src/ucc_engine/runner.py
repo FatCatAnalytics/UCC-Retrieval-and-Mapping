@@ -34,10 +34,22 @@ REVIEW_COLUMNS = [
     "ambiguous_master_candidates", "Firm_ID", "cluster_id", "cluster_label", "cluster_size",
     "suggested_mapping", "suggestion_score", "suggestion_confidence", "alternative_suggestions",
 ]
+BUCKETS = ("direct", "fuzzy_high", "review", "unmatched")
+BUCKET_LABELS = {
+    "direct": "Direct match",
+    "fuzzy_high": "Fuzzy match · high probability",
+    "review": "Review",
+    "unmatched": "Unmatched (too low)",
+}
+BUCKET_COLUMNS = [
+    "DEBT_STATE", "SECP_STATE", "SECP_NAME", "SECP_NAME_NORMALIZED", "SECP_NAME_MAPPED",
+    "matched_master_raw", "match_method", "match_score", "confidence", "Firm_ID",
+]
 MAX_LOG_LINES = 5000
 MASTER_KEY = ("DEBT_STATE", "SECP_STATE", "SECP_NAME")
 MASTER_COLUMNS = ("DEBT_STATE", "SECP_STATE", "SECP_NAME", "SECP_NAME_MAPPED", "Firm ID")
-DECISION_COLUMNS = ("key", "decision", "decided_mapped_name", "decided_firm_id", "previously_rejected", "decided_in_run")
+DECISION_COLUMNS = ("key", "decision", "decided_mapped_name", "decided_firm_id", "previously_rejected", "decided_in_run",
+                    "decision_source", "filings")
 
 
 def master_key(debt_state: Any, secp_state: Any, secp_name: Any) -> str:
@@ -45,6 +57,26 @@ def master_key(debt_state: Any, secp_state: Any, secp_name: Any) -> str:
     def st(v: Any) -> str:
         return "" if v is None or (isinstance(v, float) and v != v) else str(v).strip().upper()
     return "|".join([st(debt_state), st(secp_state), "" if secp_name is None else str(secp_name)])
+
+
+def bucket_series(df: pd.DataFrame) -> pd.Series:
+    """Classify every result row into one of ``BUCKETS``.
+
+    * ``direct``     - an exact match (raw or normalised) the pipeline accepted (AUTO)
+    * ``fuzzy_high`` - a fuzzy / embedding match above the auto threshold (AUTO); added
+                       to the updated master without review
+    * ``review``     - any REVIEW_* band (fuzzy or embedding below auto, or an
+                       ambiguous exact match): a suggestion for a human to decide
+    * ``unmatched``  - nothing above the floor; left as-is (NEW_ENTITY / no state pair)
+    """
+    conf = df["confidence"].astype("string").fillna("")
+    method = df["match_method"].astype("string").fillna("") if "match_method" in df.columns else pd.Series("", index=df.index, dtype="string")
+    out = pd.Series("unmatched", index=df.index, dtype="object")
+    auto = conf.eq("AUTO")
+    out[auto & method.str.startswith("Exact Match")] = "direct"
+    out[auto & ~method.str.startswith("Exact Match")] = "fuzzy_high"
+    out[conf.isin(REVIEW_BANDS)] = "review"
+    return out
 
 
 def _now() -> str:
@@ -242,6 +274,10 @@ class PipelineRun:
         self._persist()
 
     def _carry_forward_approvals(self) -> None:
+        try:
+            self.propagate_decisions()
+        except Exception as e:  # noqa: BLE001
+            self._log("WARNING", f"Could not propagate decisions: {e}")
         """Approvals from earlier runs that the master still lacks go straight into this run's updated master."""
         try:
             n = self.decision_counts()["unapplied_approved"]
@@ -330,6 +366,10 @@ class PipelineRun:
             "records_with_firm_id": int(df["Firm_ID"].notna().sum()) if "Firm_ID" in df.columns else 0,
             "unique_firm_ids": int(df["Firm_ID"].nunique()) if "Firm_ID" in df.columns else 0,
         }
+        bvc = bucket_series(df).value_counts()
+        out["buckets"] = {b: int(bvc.get(b, 0)) for b in BUCKETS}
+        # Review split by band, so the UI can show high / medium separately.
+        out["review_bands"] = {b: int(conf.eq(b).sum()) for b in REVIEW_BANDS}
         um = self._cache.get("updated_master_data")
         if isinstance(um, pd.DataFrame):
             src = um["_source"].astype(str) if "_source" in um.columns else pd.Series(dtype=str)
@@ -361,12 +401,16 @@ class PipelineRun:
         sort: str = "match_score",
         descending: bool = True,
         decision: str = "",
+        mapped: Optional[str] = None,
     ) -> Dict[str, Any]:
         df = self._annotated_review()
         bands = list(confidence) if confidence else list(REVIEW_BANDS)
         sub = df[df["confidence"].isin(bands)]
         if method:
             sub = sub[sub["match_method"].astype(str).str.contains(method, case=False, na=False)]
+        if mapped is not None:
+            final = sub["decided_mapped_name"].where(sub["decided_mapped_name"].notna(), sub["SECP_NAME_MAPPED"]).fillna("").astype(str)
+            sub = sub[final.eq(mapped)]
         if search:
             s = search.strip()
             mask = sub["SECP_NAME"].astype(str).str.contains(s, case=False, na=False, regex=False)
@@ -386,6 +430,36 @@ class PipelineRun:
                 row["decision"] = None
         return {"total": int(len(sub)), "offset": offset, "limit": limit, "columns": cols,
                 "rows": rows, "decision_counts": self.decision_counts()}
+
+    def rows(
+        self,
+        *,
+        bucket: str,
+        search: str = "",
+        offset: int = 0,
+        limit: int = 100,
+        sort: str = "match_score",
+        descending: bool = True,
+    ) -> Dict[str, Any]:
+        """Page the result rows of one bucket (see ``bucket_series``). Read-only view;
+        the ``review`` bucket has its own endpoint with decisions attached."""
+        if bucket not in BUCKETS:
+            raise KeyError(f"unknown bucket {bucket!r}; expected one of {BUCKETS}")
+        df = self._enriched()
+        if df is None:
+            return {"total": 0, "offset": offset, "limit": limit, "columns": BUCKET_COLUMNS, "rows": []}
+        sub = df[bucket_series(df).eq(bucket)]
+        if search:
+            s = search.strip()
+            mask = sub["SECP_NAME"].astype(str).str.contains(s, case=False, na=False, regex=False)
+            if "SECP_NAME_MAPPED" in sub.columns:
+                mask |= sub["SECP_NAME_MAPPED"].astype(str).str.contains(s, case=False, na=False, regex=False)
+            sub = sub[mask]
+        if sort in sub.columns:
+            sub = sub.sort_values(sort, ascending=not descending, na_position="last")
+        cols = [c for c in BUCKET_COLUMNS if c in sub.columns]
+        return {"total": int(len(sub)), "offset": offset, "limit": limit, "columns": cols,
+                "rows": frame_records(sub.iloc[offset: offset + limit][cols])}
 
     # --------------------------------------------------------------- decisions
     @staticmethod
@@ -409,24 +483,121 @@ class PipelineRun:
         if self._annotated and self._annotated[0] == self.decisions.version and self._annotated[1] == id(df):
             return self._annotated[2]
         sub = df[df["confidence"].isin(REVIEW_BANDS)].copy(deep=False)
-        keys = self._keys(sub)
+        # One review row per key: the same filer in the same state pair may appear
+        # on many filings, and the reviewer decides once. ``filings`` keeps the volume.
+        all_keys = self._keys(sub)
+        filings = all_keys.map(all_keys.value_counts())
+        sub = sub.assign(_key=all_keys.values, filings=filings.values).drop_duplicates("_key")
+        keys = sub.pop("_key")
         found = self.decisions.get_many(keys)
-        status, mapped, firm, prev, in_run = [], [], [], [], []
+        status, mapped, firm, prev, in_run, source = [], [], [], [], [], []
         suggestions = sub["SECP_NAME_MAPPED"] if "SECP_NAME_MAPPED" in sub.columns else pd.Series(None, index=sub.index)
         for key, suggested in zip(keys, suggestions):
             d = found.get(key)
             if d is None:
-                status.append("pending"); mapped.append(None); firm.append(None); prev.append(None); in_run.append(None)
+                status.append("pending"); mapped.append(None); firm.append(None); prev.append(None); in_run.append(None); source.append(None)
             elif d["decision"] == "rejected" and d.get("suggested") and norm_name(d["suggested"]) != norm_name(suggested):
                 status.append("pending"); mapped.append(None); firm.append(None)
-                prev.append(d["suggested"]); in_run.append(d.get("run_id"))
+                prev.append(d["suggested"]); in_run.append(d.get("run_id")); source.append(None)
             else:
                 status.append(d["decision"]); mapped.append(d.get("mapped_name")); firm.append(d.get("firm_id"))
-                prev.append(None); in_run.append(d.get("run_id"))
+                prev.append(None); in_run.append(d.get("run_id")); source.append(d.get("source"))
         sub["key"], sub["decision"], sub["decided_mapped_name"] = keys.values, status, mapped
         sub["decided_firm_id"], sub["previously_rejected"], sub["decided_in_run"] = firm, prev, in_run
+        sub["decision_source"] = source
         self._annotated = (self.decisions.version, id(df), sub)
         return sub
+
+    # ------------------------------------------------------------ propagation
+    @staticmethod
+    def _norm(name: Any) -> str:
+        from .core.utils import normalize_name
+
+        return normalize_name("" if name is None else str(name))
+
+    def _final_name(self, d: Dict[str, Any]) -> str:
+        return norm_name(d.get("mapped_name") or d.get("suggested"))
+
+    def propagate_decisions(self) -> Dict[str, int]:
+        """Inherit decisions across state pairs and spellings of the same filer.
+
+        A pending review row whose *normalised* filer name was already decided
+        elsewhere - another state pair, a typo variant, an earlier run - and
+        whose suggested bank is the same bank, gets that decision written for
+        its own key with ``source = 'inherited:<key>'`` (audited like any other
+        decision; undo works per key). Rows suggesting a *different* bank stay
+        pending: that is how PINNACLE BANK (GA) does not inherit an approval
+        meant for Pinnacle Bank (NE). Reviewer decisions outrank inherited ones.
+        """
+        if self.status in ("queued", "running") and threading.current_thread() is not self._thread:
+            raise RuntimeError("The run is still in progress")
+        # Backfill normalised names for decisions written before the column existed.
+        missing = self.decisions.missing_norm_names()
+        if missing:
+            self.decisions.set_norm_names((m["key"], self._norm(m["secp_name"])) for m in missing)
+        review = self._annotated_review()
+        pending = review[review["decision"].eq("pending") & ~review["key"].isin(self.decisions.cleared_keys())]
+        if pending.empty:
+            return {"approved": 0, "rejected": 0, "candidates": 0}
+        norms = pending["SECP_NAME"].map(self._norm)
+        pool = self.decisions.by_norm_name(norms.unique())
+        out = {"approved": 0, "rejected": 0, "candidates": int(sum(1 for n in norms if n in pool))}
+        for (_, row), nrm in zip(pending.iterrows(), norms):
+            suggested = _json_safe(row.get("SECP_NAME_MAPPED"))
+            want = norm_name(suggested)
+            if not want:
+                continue
+            # reviewer-made first, then most recent (by_norm_name is already newest-first)
+            matches = sorted((d for d in pool.get(nrm, []) if self._final_name(d) == want),
+                             key=lambda d: 0 if not d.get("source") else 1)
+            if not matches:
+                continue
+            d = matches[0]
+            origin = d["key"] if not d.get("source") else str(d["source"]).split(":", 1)[-1]
+            firm_id = d.get("firm_id")
+            if firm_id is None:
+                firm_id = _json_safe(row.get("Firm_ID"))
+            self.decisions.set(
+                str(row["key"]), decision=d["decision"], mapped_name=d.get("mapped_name"), firm_id=firm_id,
+                suggested=suggested, match_method=_json_safe(row.get("match_method")),
+                match_score=_json_safe(row.get("match_score")), confidence=_json_safe(row.get("confidence")),
+                run_id=self.id, norm_name=nrm, source=f"inherited:{origin}",
+            )
+            out[d["decision"]] += 1
+        if out["approved"] or out["rejected"]:
+            self._log("INFO", f"Inherited {out['approved']:,} approvals and {out['rejected']:,} rejections "
+                              f"from decisions on the same filer name elsewhere")
+        return out
+
+    def review_groups(self, *, decision: str = "pending", search: str = "") -> List[Dict[str, Any]]:
+        """The review queue rolled up by suggested bank, biggest first - so a
+        reviewer can clear "41 filers -> JPMorgan" in one go."""
+        df = self._annotated_review()
+        if df.empty:
+            return []
+        if decision:
+            df = df[df["decision"].eq(decision)]
+        if search.strip():
+            s = search.strip()
+            df = df[df["SECP_NAME"].astype(str).str.contains(s, case=False, na=False, regex=False)
+                    | df["SECP_NAME_MAPPED"].astype(str).str.contains(s, case=False, na=False, regex=False)]
+        bank = df["decided_mapped_name"].where(df["decided_mapped_name"].notna(), df["SECP_NAME_MAPPED"]).fillna("").astype(str)
+        g = df.assign(_bank=bank).groupby("_bank", sort=False)
+        rows = []
+        for name, grp in g:
+            fid = grp["decided_firm_id"].dropna()
+            if fid.empty and "Firm_ID" in grp.columns:
+                fid = grp["Firm_ID"].dropna()
+            vc = grp["decision"].value_counts()
+            rows.append({
+                "mapped_name": name, "firm_id": _json_safe(fid.iloc[0]) if len(fid) else None,
+                "keys": int(len(grp)), "filings": int(grp["filings"].sum()),
+                "pending": int(vc.get("pending", 0)), "approved": int(vc.get("approved", 0)), "rejected": int(vc.get("rejected", 0)),
+                "methods": {str(k): int(v) for k, v in grp["match_method"].astype(str).value_counts().items()},
+                "min_score": _json_safe(grp["match_score"].min()), "max_score": _json_safe(grp["match_score"].max()),
+            })
+        rows.sort(key=lambda r: (-r["filings"], -r["keys"], r["mapped_name"]))
+        return rows
 
     def _master_keys(self) -> set:
         um = self._master_with_source()
@@ -463,7 +634,8 @@ class PipelineRun:
         review = self._annotated_review()
         known = dict(zip(review["key"], review.index))
         changed = 0
-        for item in items:
+        items_list = list(items)
+        for item in items_list:
             key = str(item.get("key", ""))
             if key not in known:
                 raise KeyError(f"{key!r} is not a review-queue row of this run")
@@ -490,9 +662,12 @@ class PipelineRun:
                 key, decision=decision, mapped_name=mapped, firm_id=_json_safe(firm_id), suggested=suggested,
                 match_method=_json_safe(row.get("match_method")), match_score=_json_safe(row.get("match_score")),
                 confidence=_json_safe(row.get("confidence")), run_id=self.id,
+                norm_name=self._norm(row.get("SECP_NAME")), source=None,
             )
             changed += 1
-        return {"changed": changed, "counts": self.decision_counts()}
+        decided = any(item.get("decision") in DECISIONS for item in items_list)
+        inherited = self.propagate_decisions() if decided else {"approved": 0, "rejected": 0, "candidates": 0}
+        return {"changed": changed, "inherited": inherited, "counts": self.decision_counts()}
 
     def _resolve_firm_id(self, mapped_name: Optional[str]) -> Any:
         """Universe lookup by (upper-cased) bank name - the pipeline's Pass 1 rule."""

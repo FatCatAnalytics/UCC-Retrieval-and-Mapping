@@ -55,11 +55,17 @@ class PipelineConfig:
     # layout written by `ucc-engine prefetch-models`; holds both models. When
     # set, files are only read from here and nothing is downloaded.
     model_dir: str = ""
+    # Network share holding the models (same cache layout). Before a model is
+    # loaded, anything missing or newer on the share is *copied* into
+    # ``model_cache_dir`` and the local copy is used - the share is read once
+    # per PC, not once per session, and a dropped share does not break a run
+    # that already has the files locally. Nothing is ever downloaded when set.
+    model_share_dir: str = ""
     model_cache_dir: str = field(default_factory=lambda: str(app_data_dir() / "models"))
     model_threads: int = 0                      # 0 = library default
 
     # --- matching thresholds --------------------------------------------------
-    fuzzy_auto_threshold: int = 96
+    fuzzy_auto_threshold: int = 90  # see resources.py / tests/test_match_quality.py
     fuzzy_review_threshold: int = 85
     fuzzy_min_threshold: int = 80
     embed_auto_threshold: float = 0.95
@@ -108,7 +114,7 @@ class PipelineConfig:
     advanced_cross_encoder_enabled: bool = True
     advanced_cross_encoder_model: str = DEFAULT_CROSS_ENCODER
     advanced_cross_encoder_top_n: int = 10
-    advanced_cross_encoder_promote_to_auto: float = 0.92
+    advanced_cross_encoder_promote_to_auto: float = 1.01  # review-only; see resources.py
     advanced_cross_encoder_promote_to_high: float = 0.80
 
     # ------------------------------------------------------------------ helpers

@@ -83,8 +83,12 @@ def try_load_reranker(model_name: str, device: str = "cpu", config: Any = None):
     if not model_name:
         return None
     backend_pref = str(getattr(config, "embedding_backend", "auto") or "auto").lower()
-    cache_dir = str(getattr(config, "model_cache_dir", "") or Path.home() / ".cache" / "ucc-engine" / "models")
-    model_dir = str(getattr(config, "model_dir", "") or "")
+    from .embeddings import model_location
+
+    try:
+        cache_dir, model_dir = model_location(config)
+    except FileNotFoundError:
+        return None  # no models anywhere: rerank becomes a no-op, the embedding loader reports the error
     threads = int(getattr(config, "model_threads", 0) or 0)
     key = (model_name, backend_pref, cache_dir, model_dir, threads)
     if key in _RERANKER_CACHE:

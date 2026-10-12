@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  ApplyResult, DecisionCounts, DecisionItem, DecisionsPage, Health, LogLine, OutputFile, Page, RunSnapshot,
+  ApplyResult, Bucket, DecisionCounts, DecisionItem, DecisionsPage, Health, LogLine, ModelsStatus, ModelsSync, OutputFile, Page, ReviewGroup, RunSnapshot,
   SourcePreview, SourceSpec, StoreCounts, Summary,
 } from "./types";
 
@@ -57,6 +57,15 @@ export class EngineClient {
   prefetchModels = (overrides: Record<string, unknown> = {}) =>
     this.req<Record<string, string>>("/models/prefetch", { method: "POST", body: JSON.stringify(overrides) });
 
+  modelsStatus = (q: { model_share_dir?: string; model_cache_dir?: string }) => {
+    const p = new URLSearchParams();
+    if (q.model_share_dir) p.set("model_share_dir", q.model_share_dir);
+    if (q.model_cache_dir) p.set("model_cache_dir", q.model_cache_dir);
+    return this.req<ModelsStatus>(`/models/status?${p}`);
+  };
+  syncModels = (overrides: Record<string, unknown> = {}) =>
+    this.req<ModelsSync>("/models/sync", { method: "POST", body: JSON.stringify(overrides) });
+
   previewSource = (source: SourceSpec) =>
     this.req<SourcePreview>("/sources/preview", { method: "POST", body: JSON.stringify({ source }) });
 
@@ -72,15 +81,26 @@ export class EngineClient {
   summary = (id: string) => this.req<Summary>(`/runs/${id}/summary`);
   outputs = (id: string) => this.req<OutputFile[]>(`/runs/${id}/outputs`);
 
-  review = (id: string, q: { confidence?: string[]; search?: string; method?: string; decision?: string; offset?: number; limit?: number }) => {
+  review = (id: string, q: { confidence?: string[]; search?: string; method?: string; decision?: string; mapped?: string; offset?: number; limit?: number }) => {
     const p = new URLSearchParams();
     (q.confidence ?? []).forEach((c) => p.append("confidence", c));
     if (q.search) p.set("search", q.search);
     if (q.method) p.set("method", q.method);
     if (q.decision) p.set("decision", q.decision);
+    if (q.mapped != null) p.set("mapped", q.mapped);
     p.set("offset", String(q.offset ?? 0));
     p.set("limit", String(q.limit ?? 100));
     return this.req<Page>(`/runs/${id}/review?${p}`);
+  };
+
+  /** Read-only page of one result bucket. */
+  rows = (id: string, q: { bucket: Bucket; search?: string; offset?: number; limit?: number }) => {
+    const p = new URLSearchParams();
+    p.set("bucket", q.bucket);
+    if (q.search) p.set("search", q.search);
+    p.set("offset", String(q.offset ?? 0));
+    p.set("limit", String(q.limit ?? 100));
+    return this.req<Page>(`/runs/${id}/rows?${p}`);
   };
 
   clusters = (id: string, q: { search?: string; min_size?: number; offset?: number; limit?: number }) => {
@@ -92,9 +112,19 @@ export class EngineClient {
     return this.req<Page>(`/runs/${id}/clusters?${p}`);
   };
 
+  /** The review queue rolled up by suggested bank, biggest first. */
+  reviewGroups = (id: string, q: { decision?: string; search?: string }) => {
+    const p = new URLSearchParams();
+    p.set("decision", q.decision ?? "pending");
+    if (q.search) p.set("search", q.search);
+    return this.req<ReviewGroup[]>(`/runs/${id}/review/groups?${p}`);
+  };
+  propagateDecisions = (id: string) =>
+    this.req<{ approved: number; rejected: number; candidates: number; counts: DecisionCounts }>(`/runs/${id}/propagate-decisions`, { method: "POST" });
+
   decisions = (id: string) => this.req<{ counts: DecisionCounts }>(`/runs/${id}/decisions`);
   setDecisions = (id: string, items: DecisionItem[]) =>
-    this.req<{ changed: number; counts: DecisionCounts }>(`/runs/${id}/decisions`, { method: "PUT", body: JSON.stringify({ items }) });
+    this.req<{ changed: number; inherited: { approved: number; rejected: number }; counts: DecisionCounts }>(`/runs/${id}/decisions`, { method: "PUT", body: JSON.stringify({ items }) });
   applyDecisions = (id: string) => this.req<ApplyResult>(`/runs/${id}/apply-decisions`, { method: "POST" });
 
   // The decisions database (every run)

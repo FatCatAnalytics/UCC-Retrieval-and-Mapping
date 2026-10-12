@@ -1,12 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { EngineClient, resolveEngineUrl } from "./api";
-import type { Health, RunSnapshot, SourceSpec } from "./types";
-import { SetupView } from "./views/SetupView";
-import { RunView } from "./views/RunView";
-import { ResultsView } from "./views/ResultsView";
+import type { Health, RunSnapshot } from "./types";
+import { PipelineView } from "./views/PipelineView";
 import { DecisionsView } from "./views/DecisionsView";
 
-type View = "setup" | "run" | "results" | "decisions";
+type View = "pipeline" | "decisions";
 
 export default function App() {
   const [client, setClient] = useState<EngineClient | null>(null);
@@ -14,8 +12,7 @@ export default function App() {
   const [bootError, setBootError] = useState<string | null>(null);
   const [runs, setRuns] = useState<RunSnapshot[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [view, setView] = useState<View>("setup");
-  const [lastSource, setLastSource] = useState<SourceSpec | null>(null);
+  const [view, setView] = useState<View>("pipeline");
 
   // Boot: find the engine, then poll health + run list.
   useEffect(() => {
@@ -24,7 +21,6 @@ export default function App() {
       try {
         const url = await resolveEngineUrl();
         const c = new EngineClient(url);
-        // Wait for the HTTP server to accept connections.
         for (let i = 0; i < 100; i++) {
           try {
             const h = await c.health();
@@ -51,16 +47,15 @@ export default function App() {
       const [list, h] = await Promise.all([client.listRuns(), client.health()]);
       setRuns(list);
       setHealth(h);
-      if (!selected && list[0]) setSelected(list[0].id);
     } catch {
       /* transient */
     }
-  }, [client, selected]);
+  }, [client]);
 
   useEffect(() => {
     if (!client) return;
     refreshRuns();
-    const t = setInterval(refreshRuns, 2000);
+    const t = setInterval(refreshRuns, 3000);
     return () => clearInterval(t);
   }, [client, refreshRuns]);
 
@@ -69,8 +64,9 @@ export default function App() {
   const onStarted = (run: RunSnapshot) => {
     setRuns((prev) => [run, ...prev]);
     setSelected(run.id);
-    setView("run");
+    setView("pipeline");
   };
+  const onUpdate = useCallback((r: RunSnapshot) => setRuns((prev) => prev.map((x) => (x.id === r.id ? r : x))), []);
 
   if (bootError) {
     return (
@@ -99,9 +95,10 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand">
           <span className="brand-mark">UCC</span>
-          <span className="brand-text">Mapping</span>
+          <span className="brand-text">Mapping pipeline</span>
         </div>
-        <button className="btn btn-primary wide" onClick={() => setView("setup")}>
+        <button className={`btn wide ${!selected && view === "pipeline" ? "btn-primary" : ""}`}
+          onClick={() => { setSelected(null); setView("pipeline"); }}>
           + New run
         </button>
         <div className="runs-list">
@@ -109,17 +106,15 @@ export default function App() {
           {runs.map((r) => (
             <button
               key={r.id}
-              className={`run-item ${r.id === selected ? "active" : ""}`}
-              onClick={() => {
-                setSelected(r.id);
-                setView(r.status === "succeeded" ? "results" : "run");
-              }}
+              className={`run-item ${r.id === selected && view === "pipeline" ? "active" : ""}`}
+              onClick={() => { setSelected(r.id); setView("pipeline"); }}
             >
               <span className={`dot ${r.status}`} />
               <span className="run-name">{r.name}</span>
               <span className="muted small">
                 {r.status === "running" ? `${Math.round(r.progress * 100)}%` : r.status}
                 {r.sample_rows ? ` · sample ${r.sample_rows.toLocaleString()}` : ""}
+                {r.summary?.buckets ? ` · ${r.summary.buckets.review.toLocaleString()} to review` : ""}
               </span>
             </button>
           ))}
@@ -131,32 +126,17 @@ export default function App() {
           </span>
         </button>
         <footer className="sidebar-footer muted small">
-          engine v{health?.version} · {health?.backends.fastembed ? "fastembed" : "sentence-transformers"} · local
-          CPU
+          engine v{health?.version} · {health?.backends.fastembed ? "fastembed" : "sentence-transformers"} · local CPU
         </footer>
       </aside>
 
       <main className="content">
-        {view === "setup" && (
-          <SetupView client={client} health={health} initialSource={lastSource} onStarted={(run, src) => {
-            setLastSource(src);
-            onStarted(run);
-          }} />
+        {view === "pipeline" && (
+          <PipelineView client={client} health={health} run={selectedRun} onStarted={onStarted} onUpdate={onUpdate}
+            onNewRun={() => setSelected(null)} />
         )}
-        {view === "run" && selectedRun && (
-          <RunView
-            client={client}
-            run={selectedRun}
-            onUpdate={(r) => setRuns((prev) => prev.map((x) => (x.id === r.id ? r : x)))}
-            onViewResults={() => setView("results")}
-          />
-        )}
-        {view === "results" && selectedRun && <ResultsView client={client} run={selectedRun} />}
         {view === "decisions" && (
-          <DecisionsView client={client} health={health} runs={runs} onOpenRun={(id) => { setSelected(id); setView("results"); }} />
-        )}
-        {(view === "run" || view === "results") && !selectedRun && (
-          <div className="empty">Select a run from the left, or start a new one.</div>
+          <DecisionsView client={client} health={health} runs={runs} onOpenRun={(id) => { setSelected(id); setView("pipeline"); }} />
         )}
       </main>
     </div>

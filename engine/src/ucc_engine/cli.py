@@ -119,6 +119,19 @@ def cmd_prefetch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync_models(args: argparse.Namespace) -> int:
+    """Copy the models from the network share into this PC's model folder."""
+    from .config import PipelineConfig
+    from .model_sync import sync_models_from_share
+
+    cfg = PipelineConfig.from_overrides({**_kv(args.set), "model_share_dir": args.share or ""})
+    if not cfg.model_share_dir:
+        print("error: give the share with --share \\\\server\\share\\ucc-models (or --set model_share_dir=...)", file=sys.stderr)
+        return 2
+    print(json.dumps(sync_models_from_share(cfg.model_share_dir, cfg.model_cache_dir, lambda _l, m: print(m)), indent=2))
+    return 0
+
+
 def cmd_sync_check(_: argparse.Namespace) -> int:
     import runpy
 
@@ -158,6 +171,11 @@ def main(argv: List[str] | None = None) -> int:
     f = sub.add_parser("prefetch-models", help="download local models into the cache")
     f.add_argument("--set", action="append", metavar="KEY=VALUE")
     f.set_defaults(fn=cmd_prefetch)
+
+    m = sub.add_parser("sync-models", help="copy the models from a network share into the local model folder")
+    m.add_argument("--share", default="", help="network share / UNC path holding the models (model_share_dir)")
+    m.add_argument("--set", action="append", metavar="KEY=VALUE")
+    m.set_defaults(fn=cmd_sync_models)
 
     c = sub.add_parser("sync-check", help="verify core/ matches the Dagster assets.py")
     c.set_defaults(fn=cmd_sync_check)

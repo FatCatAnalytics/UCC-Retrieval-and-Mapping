@@ -20,7 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 DECISIONS = ("approved", "rejected")
 _COLUMNS = ("key", "debt_state", "secp_state", "secp_name", "decision", "suggested", "mapped_name",
-            "firm_id", "match_method", "match_score", "confidence", "run_id", "decided_at")
+            "firm_id", "match_method", "match_score", "confidence", "run_id", "decided_at", "norm_name", "source")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS decisions (
@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS decisions (
     match_score  REAL,
     confidence   TEXT,
     run_id       TEXT,
-    decided_at   TEXT NOT NULL
+    decided_at   TEXT NOT NULL,
+    norm_name    TEXT,                      -- normalised secp_name: decisions propagate across state pairs / spellings
+    source       TEXT                       -- NULL = a reviewer decided; 'inherited:<key>' = propagated from that key
 );
 CREATE INDEX IF NOT EXISTS decisions_decision ON decisions (decision);
 CREATE TABLE IF NOT EXISTS decision_log (
@@ -86,7 +88,18 @@ class DecisionStore:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.executescript(_SCHEMA)
+        self._migrate()
         self.version = 0  # bumped on every write; callers use it to invalidate caches
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the first release to an existing database."""
+        have = {r["name"] for r in self._db.execute("PRAGMA table_info(decisions)")}
+        with self._db:
+            if "norm_name" not in have:
+                self._db.execute("ALTER TABLE decisions ADD COLUMN norm_name TEXT")
+            if "source" not in have:
+                self._db.execute("ALTER TABLE decisions ADD COLUMN source TEXT")
+            self._db.execute("CREATE INDEX IF NOT EXISTS decisions_norm_name ON decisions (norm_name)")
 
     # ------------------------------------------------------------------ reads
     def get(self, key: str) -> Optional[Dict[str, Any]]:
@@ -103,6 +116,38 @@ class DecisionStore:
                 q = f"SELECT * FROM decisions WHERE key IN ({','.join('?' * len(chunk))})"
                 out.update({r["key"]: dict(r) for r in self._db.execute(q, chunk)})
         return out
+
+    def by_norm_name(self, norm_names: Iterable[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """Every decision whose normalised filer name is one of ``norm_names``."""
+        names = [n for n in dict.fromkeys(norm_names) if n]
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        with self._lock:
+            for i in range(0, len(names), 900):
+                chunk = names[i:i + 900]
+                q = f"SELECT * FROM decisions WHERE norm_name IN ({','.join('?' * len(chunk))}) ORDER BY decided_at DESC"
+                for r in self._db.execute(q, chunk):
+                    out.setdefault(r["norm_name"], []).append(dict(r))
+        return out
+
+    def cleared_keys(self) -> set:
+        """Keys whose most recent audit action is 'cleared' - the reviewer undid them
+        on purpose, so propagation must not decide them again."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT key FROM decision_log WHERE action = 'cleared' AND id IN "
+                "(SELECT MAX(id) FROM decision_log GROUP BY key)").fetchall()
+        return {r["key"] for r in rows}
+
+    def missing_norm_names(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [dict(r) for r in self._db.execute("SELECT key, secp_name FROM decisions WHERE norm_name IS NULL")]
+
+    def set_norm_names(self, pairs: Iterable[tuple]) -> int:
+        """Backfill ``norm_name`` for rows written before the column existed."""
+        pairs = list(pairs)
+        with self._lock, self._db:
+            self._db.executemany("UPDATE decisions SET norm_name = ? WHERE key = ?", [(n, k) for k, n in pairs])
+        return len(pairs)
 
     def approved(self) -> List[Dict[str, Any]]:
         with self._lock:
@@ -156,6 +201,7 @@ class DecisionStore:
             "firm_id": _int_or_none(fields.get("firm_id")), "match_method": fields.get("match_method"),
             "match_score": fields.get("match_score"), "confidence": fields.get("confidence"),
             "run_id": fields.get("run_id"), "decided_at": fields.get("decided_at") or _now(),
+            "norm_name": fields.get("norm_name"), "source": fields.get("source"),
         }
         cols = ", ".join(row)
         sets = ", ".join(f"{c} = excluded.{c}" for c in row if c != "key")
@@ -163,9 +209,10 @@ class DecisionStore:
             self._db.execute(
                 f"INSERT INTO decisions ({cols}) VALUES ({','.join('?' * len(row))}) "
                 f"ON CONFLICT(key) DO UPDATE SET {sets}", list(row.values()))
+            action = decision if not row["source"] else f"{decision} ({row['source']})"
             self._db.execute(
                 "INSERT INTO decision_log (key, action, suggested, mapped_name, firm_id, run_id, at) VALUES (?,?,?,?,?,?,?)",
-                (key, decision, row["suggested"], row["mapped_name"], row["firm_id"], row["run_id"], row["decided_at"]))
+                (key, action, row["suggested"], row["mapped_name"], row["firm_id"], row["run_id"], row["decided_at"]))
             self.version += 1
 
     def clear(self, key: str, run_id: Optional[str] = None) -> bool:

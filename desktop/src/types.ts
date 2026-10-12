@@ -30,9 +30,14 @@ export interface Summary {
   unique_firm_ids: number;
   updated_master?: { rows: number; original_rows: number; added_rows: number; approved_rows?: number; file: string | null };
   lead_bank?: { rows: number; columns: string[] };
+  /** The four pipeline buckets every result row lands in (see engine `bucket_series`). */
+  buckets?: Record<Bucket, number>;
+  review_bands?: Record<string, number>;
   stage_seconds: Record<string, number>;
   total_seconds: number;
 }
+
+export type Bucket = "direct" | "fuzzy_high" | "review" | "unmatched";
 
 export interface RunSnapshot {
   id: string;
@@ -161,4 +166,40 @@ export interface Health {
   decisions: StoreCounts;
   backends: Record<string, boolean>;
   active_run: string | null;
+}
+
+/** GET /models/status */
+export interface ModelsStatus {
+  share: string;
+  share_reachable: boolean;
+  share_models: string[];
+  local: string;
+  local_models: string[];
+  last_synced: string | null;
+  last_synced_from: string | null;
+}
+
+/** POST /models/sync */
+export interface ModelsSync {
+  share: string;
+  local: string;
+  models: string[];
+  copied: number;
+  bytes: number;
+  seconds: number;
+  status: "updated" | "up_to_date" | "share_unreachable";
+}
+
+/** GET /runs/{id}/review/groups — one row per suggested bank. */
+export interface ReviewGroup {
+  mapped_name: string;
+  firm_id: number | string | null;
+  keys: number;
+  filings: number;
+  pending: number;
+  approved: number;
+  rejected: number;
+  methods: Record<string, number>;
+  min_score: number | null;
+  max_score: number | null;
 }

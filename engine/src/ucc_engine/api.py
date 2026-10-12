@@ -15,7 +15,7 @@ from . import __version__
 from .config import PipelineConfig, app_data_dir
 from .datasources import CsvSourceSpec, DataSourceError, SqlSourceSpec, SourceSpec, make_datasource
 from .embeddings import available_backends, prefetch_models
-from .runner import REVIEW_BANDS, RunStore
+from .runner import BUCKETS, REVIEW_BANDS, RunStore
 
 
 class RunRequest(BaseModel):
@@ -86,6 +86,29 @@ def create_app(store: Optional[RunStore] = None) -> FastAPI:
             raise HTTPException(500, f"Model prefetch failed: {e}") from e
 
     # ------------------------------------------------------------- sources
+    @app.get("/models/status")
+    def models_status(model_share_dir: str = "", model_cache_dir: str = "") -> Dict[str, Any]:
+        """Is the network model share reachable, what is on it, what is local, when last copied."""
+        from .model_sync import sync_status
+
+        cfg = PipelineConfig.from_overrides({"model_share_dir": model_share_dir, "model_cache_dir": model_cache_dir})
+        return sync_status(cfg.model_share_dir, cfg.model_cache_dir)
+
+    @app.post("/models/sync")
+    def models_sync(overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        """Copy the models from `model_share_dir` into the local model folder now."""
+        from .model_sync import sync_models_from_share
+
+        cfg = PipelineConfig.from_overrides(overrides or {})
+        if not cfg.model_share_dir:
+            raise HTTPException(400, "model_share_dir is not set")
+        try:
+            return sync_models_from_share(cfg.model_share_dir, cfg.model_cache_dir)
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e)) from e
+        except OSError as e:
+            raise HTTPException(500, f"Copying models failed: {e}") from e
+
     @app.post("/sources/preview")
     def sources_preview(req: PreviewRequest) -> Dict[str, Any]:
         try:
@@ -153,9 +176,39 @@ def create_app(store: Optional[RunStore] = None) -> FastAPI:
         sort: str = "match_score",
         descending: bool = True,
         decision: Literal["", "pending", "approved", "rejected"] = "",
+        mapped: Optional[str] = Query(None, description="exact suggested/decided bank name (from /review/groups)"),
     ) -> Dict[str, Any]:
         return _get(run_id).review(confidence=confidence, search=search, method=method, offset=offset,
-                                   limit=limit, sort=sort, descending=descending, decision=decision)
+                                   limit=limit, sort=sort, descending=descending, decision=decision, mapped=mapped)
+
+    @app.get("/runs/{run_id}/review/groups")
+    def runs_review_groups(
+        run_id: str, decision: Literal["", "pending", "approved", "rejected"] = "pending", search: str = "",
+    ) -> List[Dict[str, Any]]:
+        """The review queue rolled up by suggested bank (biggest first)."""
+        return _get(run_id).review_groups(decision=decision, search=search)
+
+    @app.post("/runs/{run_id}/propagate-decisions")
+    def runs_propagate(run_id: str) -> Dict[str, Any]:
+        """Inherit decisions already made on the same filer name (other state pairs / spellings / runs)."""
+        run = _get(run_id)
+        try:
+            return {**run.propagate_decisions(), "counts": run.decision_counts()}
+        except RuntimeError as e:
+            raise HTTPException(409, str(e)) from e
+
+    @app.get("/runs/{run_id}/rows")
+    def runs_rows(
+        run_id: str,
+        bucket: Literal["direct", "fuzzy_high", "review", "unmatched"] = Query(..., description=f"one of {list(BUCKETS)}"),
+        search: str = "",
+        offset: int = Query(0, ge=0),
+        limit: int = Query(100, ge=1, le=1000),
+        sort: str = "match_score",
+        descending: bool = True,
+    ) -> Dict[str, Any]:
+        """Read-only page of one result bucket (direct / fuzzy_high / review / unmatched)."""
+        return _get(run_id).rows(bucket=bucket, search=search, offset=offset, limit=limit, sort=sort, descending=descending)
 
     # ----------------------------------------------------- review decisions
     @app.get("/runs/{run_id}/decisions")

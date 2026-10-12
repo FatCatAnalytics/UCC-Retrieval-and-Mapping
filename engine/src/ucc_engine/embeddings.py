@@ -185,6 +185,38 @@ def resolve_backend(requested: str) -> str:
 _MODEL_CACHE: dict[tuple, Any] = {}
 
 
+_SYNCED: set[tuple[str, str]] = set()
+
+
+def model_location(config: Any, context: Any = None) -> tuple[str, str]:
+    """``(cache_dir, model_dir)`` to load models from, honouring the three ways
+    a site can provide them:
+
+    1. ``model_dir`` set       - read in place (local folder or network share), offline.
+    2. ``model_share_dir`` set - copy anything missing/newer from the share into
+                                 ``model_cache_dir`` (once per process), then load
+                                 the local copy offline.
+    3. neither                 - ``model_cache_dir``; missing models download.
+    """
+    model_dir = str(getattr(config, "model_dir", "") or "")
+    cache_dir = str(getattr(config, "model_cache_dir", "") or Path.home() / ".cache" / "ucc-engine" / "models")
+    share_dir = str(getattr(config, "model_share_dir", "") or "")
+    if model_dir:
+        if not Path(model_dir).is_dir():
+            raise FileNotFoundError(f"model_dir {model_dir!r} does not exist or is not reachable")
+        return cache_dir, model_dir
+    if share_dir:
+        from .model_sync import sync_models_from_share
+
+        if (share_dir, cache_dir) not in _SYNCED:
+            log = (lambda lvl, msg: getattr(context.log, lvl.lower(), context.log.info)(msg)) if context is not None else (lambda _l, _m: None)
+            sync_models_from_share(share_dir, cache_dir, log)
+            _SYNCED.add((share_dir, cache_dir))
+        return cache_dir, cache_dir  # local copy, offline
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    return cache_dir, ""
+
+
 def load_embedding_model(config: Any, context: Any = None):
     """Factory used by the generated core in place of ``SentenceTransformer(...)``.
 
@@ -193,18 +225,12 @@ def load_embedding_model(config: Any, context: Any = None):
     """
     backend = resolve_backend(getattr(config, "embedding_backend", "auto"))
     model_name = getattr(config, "embedding_model", "BAAI/bge-small-en-v1.5")
-    model_dir = getattr(config, "model_dir", "") or ""
-    cache_dir = getattr(config, "model_cache_dir", "") or str(Path.home() / ".cache" / "ucc-engine" / "models")
+    cache_dir, model_dir = model_location(config, context)
     threads = int(getattr(config, "model_threads", 0) or 0)
     key = (backend, model_name, model_dir, cache_dir, threads)
 
     model = _MODEL_CACHE.get(key)
     if model is None:
-        if model_dir:
-            if not Path(model_dir).is_dir():
-                raise FileNotFoundError(f"model_dir {model_dir!r} does not exist or is not reachable")
-        else:
-            Path(cache_dir).mkdir(parents=True, exist_ok=True)
         if context is not None:
             context.log.info(f"Loading embedding model {model_name!r} via {backend} (local CPU)")
         cls = FastEmbedBackend if backend == "fastembed" else SentenceTransformerBackend
@@ -220,6 +246,8 @@ def prefetch_models(config: Any) -> dict[str, str]:
     out: dict[str, str] = {}
     model = load_embedding_model(config)
     out["embedding"] = model.model_id
+    cache_dir, model_dir = model_location(config)
+    out["location"] = model_dir or cache_dir
     rr = try_load_reranker(getattr(config, "advanced_cross_encoder_model", ""), config=config)
     out["reranker"] = getattr(rr, "model_id", "unavailable") if rr is not None else "unavailable"
     return out

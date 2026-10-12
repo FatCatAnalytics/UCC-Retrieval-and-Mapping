@@ -2,25 +2,51 @@
 
 Tauri 2 shell (Rust) + React/TypeScript UI around the Python engine in
 `../engine`. The app starts the engine as a sidecar, talks to it over
-`http://127.0.0.1:<port>`, and shows:
+`http://127.0.0.1:<port>`, and shows the work as one **pipeline**:
 
-1. **Setup** - pick the UCC filings, Master Mapping and Universe CSVs (or enter
-   a SQL connection + three queries), check the inputs, optionally run on a
-   random sample, tweak thresholds.
-2. **Run** - the 17 stages with live status/timings and the streamed log;
-   cancel after the current stage.
-3. **Results** - summary (auto / review / new entities / Firm-ID coverage,
-   match-method and confidence breakdowns, stage timings), the **review queue**
-   where you approve, correct-then-approve, or reject each suggestion (approved
-   rows are appended to the updated master with **Add N approved to updated
-   master**), new-entity clusters when clustering is on, the output files, and
-   **Promote as new master** (applies pending approvals, then copies the run's
-   `updated_master_*.csv` over your Master Mapping file, keeping a timestamped
-   backup).
-4. **Decisions** (sidebar) - the decisions database across all runs: every
-   approve / reject with who-what-when, search, undo, CSV export. Decided filers
-   are skipped in future review queues ("To decide" only ever shows what nobody
-   has looked at); approved mappings flow into later runs' updated masters.
+```
+1 · Ingest ─► 2 · Direct match ─► 3 · Fuzzy match ─► ┬► High probability   (auto-accepted)
+   drop the                                           ├► Review             (a person decides)
+   3 CSVs                                             └► Unmatched          (left as filed)   ─► 4 · Outputs
+```
+
+* **Ingest** – drag the latest UCC filings CSV, the current enriched mapping
+  and (optionally) the Universe onto the three zones, or click to browse. A
+  file dropped anywhere on the node is routed by name (`master…` / `mapping…`
+  → mapping, `universe…` / `bank…` → Universe, else UCC). The panel below has
+  *Check inputs*, the run name, the quick-test sample size, the **Matching
+  models** card (see below) and the probability thresholds.
+* **Direct match** – Stages 1–2 (exact on the filed name, then on the
+  normalised name). **Fuzzy match** – Stages 3–4 (rapidfuzz, then embedding +
+  multi-signal scoring + cross-encoder rerank). Each node shows live status,
+  timing and counts; click it for its steps, its slice of the log and the
+  match-method breakdown.
+* **Categorise** – every scored candidate lands in one bucket:
+  *High probability* (above `fuzzy_auto_threshold` / `embed_auto_threshold`;
+  added to the updated mapping without review – browse the table and
+  spot-check), *Review* (the approve / correct / reject queue, shown **by bank** so a
+  block of filers suggesting the same bank is one decision; decisions are
+  remembered across runs and inherited by the same filer name in other state
+  pairs and spellings), *Unmatched* (below the floor; exported, never
+  written to the mapping).
+* **Outputs** – the updated mapping (+ **Promote as new mapping**, which
+  applies pending approvals first and keeps a timestamped backup), step timings
+  and the output files.
+* **Decisions** (sidebar) – the decisions database across all runs.
+
+Clustering (Stages 5–7) is not exposed in the UI; the engine keeps the code
+path behind `clustering_enabled` (default off).
+
+### Matching models on a network share
+
+The two models (~150 MB) live on a network folder and are **copied onto the
+PC** into the application's local model folder, not read over the LAN at run
+time. Set *Network model folder* on the Ingest panel (it is remembered on that
+PC) and click *Copy models from network*, or just run the pipeline – anything
+missing or newer on the share is copied before the first model loads, after
+which the local copy is used offline. If the share is unreachable and the PC
+already has the files, the run proceeds on the local copy. See "Where the
+models live" in `../engine/README.md` for preparing the share.
 
 No LLM and no network inference: the two small models run on the local CPU.
 
@@ -105,7 +131,7 @@ npm run app:build                                             # -> src-tauri/tar
 
 ```
 desktop/
-├── src/                    React UI (App, views/Setup|Run|Results, api.ts client, types.ts)
+├── src/                    React UI (App, views/PipelineView + tables + DecisionsView, api.ts client, types.ts)
 ├── src-tauri/
 │   ├── src/lib.rs          sidecar lifecycle, port discovery, file dialogs, reveal/open
 │   ├── tauri.conf.json     externalBin = binaries/ucc-engine

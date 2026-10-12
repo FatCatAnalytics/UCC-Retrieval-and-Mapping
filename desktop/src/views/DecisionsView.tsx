@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { EngineClient, native } from "../api";
 import type { DecisionRecord, DecisionsPage, Health, RunSnapshot } from "../types";
-import { LoadFailed, describeError } from "./ResultsView";
+import { LoadFailed, describeError } from "./tables";
 
 interface Props {
   client: EngineClient;
