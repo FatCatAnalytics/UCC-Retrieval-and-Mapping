@@ -46,8 +46,9 @@ class PipelineConfig:
     # "auto": fastembed if installed, else sentence-transformers.
     embedding_backend: str = "auto"            # auto | fastembed | sentence-transformers
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
-    # Directory holding pre-downloaded model files (air-gapped installs). When
-    # set, no download is attempted.
+    # Offline model folder (local path or network share / UNC path) in the cache
+    # layout written by `ucc-engine prefetch-models`; holds both models. When
+    # set, files are only read from here and nothing is downloaded.
     model_dir: str = ""
     model_cache_dir: str = field(default_factory=lambda: str(app_data_dir() / "models"))
     model_threads: int = 0                      # 0 = library default

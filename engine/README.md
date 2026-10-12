@@ -74,8 +74,8 @@ field-for-field (thresholds, clustering, performance, lead-bank, rerank), plus:
 |---|---|---|
 | `embedding_backend` | `auto` | `fastembed` if installed, else `sentence-transformers` |
 | `embedding_model` | `BAAI/bge-small-en-v1.5` | 384-dim; keep in sync with any persisted query cache |
-| `model_dir` | `""` | directory of pre-downloaded model files for air-gapped machines (disables downloads) |
-| `model_cache_dir` | `<app data>/models` | where models are downloaded |
+| `model_dir` | `""` | offline model folder - local path **or network share / UNC path** - holding both models; when set nothing is downloaded (see below) |
+| `model_cache_dir` | `<app data>/models` | where models are downloaded when `model_dir` is not set |
 | `model_threads` | `0` | ONNX / torch intra-op threads (0 = library default) |
 
 ## Packaging the sidecar
@@ -86,5 +86,26 @@ python scripts/build_sidecar.py              # release: PyInstaller one-file bin
                                              #   ../desktop/src-tauri/binaries/ucc-engine-<target-triple>
 ```
 
-Model weights are not inside the binary; they download on first use. To ship
-them, copy the contents of `model_cache_dir` next to the app and set `model_dir`.
+### Where the models live
+
+The models are plain files (~150 MB: an ONNX graph + tokenizer each) that ONNX
+Runtime loads into the engine process once per session. There is no model
+server and no network inference. Options:
+
+1. **Default** - downloaded on first use (or via *Prepare models*) into
+   `model_cache_dir` (`%LOCALAPPDATA%\ucc-engine\models` on Windows,
+   `~/Library/Application Support/ucc-engine/models` on macOS). Needs internet once per PC.
+2. **Network share** - run once, from any machine with internet:
+
+   ```bash
+   ucc-engine prefetch-models --set "model_cache_dir=\\\\fileserver\\apps\\ucc-models"
+   ```
+
+   then set `model_dir` to that path on every PC (advanced settings in the app,
+   or `--set model_dir=...`). Files are only read; ~150 MB crosses the LAN per
+   app session, the share can be read-only, and no PC needs internet.
+3. **Share as distribution point** - copy that folder to each PC's
+   `model_cache_dir` (login script / installer) for the fastest start.
+
+The folder layout is fastembed's cache layout (`models--Qdrant--bge-small-en-v1.5-onnx-Q/`,
+`models--Xenova--ms-marco-MiniLM-L-6-v2/`); `prefetch-models` writes exactly that.

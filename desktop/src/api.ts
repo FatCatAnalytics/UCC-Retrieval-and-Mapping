@@ -51,7 +51,8 @@ export class EngineClient {
 
   health = () => this.req<Health>("/health");
   configDefaults = () => this.req<{ defaults: Record<string, unknown>; schema: unknown[] }>("/config/defaults");
-  prefetchModels = () => this.req<Record<string, string>>("/models/prefetch", { method: "POST", body: "{}" });
+  prefetchModels = (overrides: Record<string, unknown> = {}) =>
+    this.req<Record<string, string>>("/models/prefetch", { method: "POST", body: JSON.stringify(overrides) });
 
   previewSource = (source: SourceSpec) =>
     this.req<SourcePreview>("/sources/preview", { method: "POST", body: JSON.stringify({ source }) });

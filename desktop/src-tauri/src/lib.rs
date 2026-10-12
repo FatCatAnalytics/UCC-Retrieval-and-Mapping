@@ -164,9 +164,42 @@ fn start_engine(app: &AppHandle) {
     });
 }
 
+/// Stop the engine *gracefully*: dropping the child handle closes its stdin, and
+/// the engine (started with `--exit-on-stdin-close`) exits on EOF. That lets the
+/// PyInstaller one-file bootloader remove its `%TEMP%\_MEIxxxx` extraction -
+/// killing it outright would leak ~250 MB per session on Windows. Only if the
+/// engine is still listening after a grace period do we hard-kill it.
 fn stop_engine(app: &AppHandle) {
-    if let Some(child) = app.state::<EngineState>().lock().unwrap().child.take() {
-        let _ = child.kill();
+    let (child, url) = {
+        let state = app.state::<EngineState>();
+        let mut e = state.lock().unwrap();
+        (e.child.take(), e.url.clone())
+    };
+    let Some(child) = child else { return };
+    let pid = child.pid();
+    drop(child);
+
+    let Some(port) = url.as_deref().and_then(|u| u.rsplit(':').next()).and_then(|p| p.parse::<u16>().ok()) else {
+        return force_kill(pid);
+    };
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    for _ in 0..30 {
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100)).is_err() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    force_kill(pid);
+}
+
+fn force_kill(pid: u32) {
+    let pid = pid.to_string();
+    #[cfg(windows)]
+    let status = std::process::Command::new("taskkill").args(["/PID", &pid, "/T", "/F"]).status();
+    #[cfg(not(windows))]
+    let status = std::process::Command::new("kill").args(["-9", &pid]).status();
+    if let Err(err) = status {
+        eprintln!("[ucc-engine] could not force-kill pid {pid}: {err}");
     }
 }
 

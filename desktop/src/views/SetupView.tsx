@@ -10,6 +10,7 @@ interface Props {
 }
 
 const LS_KEY = "ucc.lastSource";
+const LS_OVERRIDES = "ucc.overrides";
 
 const emptyCsv: CsvSource = { type: "csv", ucc_path: "", master_path: "", universe_path: "" };
 const emptySql: SqlSource = {
@@ -35,7 +36,22 @@ export function SetupView({ client, health, initialSource, onStarted }: Props) {
   const [sample, setSample] = useState<number>(0);
   const [name, setName] = useState("");
   const [advanced, setAdvanced] = useState(false);
-  const [overrides, setOverrides] = useState<Record<string, string>>({});
+  // Overrides persist across sessions: `model_dir` (e.g. a network share) is a per-site setting.
+  const [overrides, setOverrides] = useState<Record<string, string>>(() => {
+    try {
+      return (JSON.parse(localStorage.getItem(LS_OVERRIDES) ?? "{}") as Record<string, string>) ?? {};
+    } catch {
+      return {};
+    }
+  });
+  const updateOverride = (k: string, v: string) =>
+    setOverrides((prev) => {
+      const next = { ...prev, [k]: v };
+      localStorage.setItem(LS_OVERRIDES, JSON.stringify(next));
+      return next;
+    });
+  const activeOverrides = () =>
+    Object.fromEntries(Object.entries(overrides).filter(([, v]) => v.trim() !== "").map(([k, v]) => [k, v.trim()]));
   const [defaults, setDefaults] = useState<Record<string, unknown>>({});
   const [preview, setPreview] = useState<SourcePreview | null>(null);
   const [busy, setBusy] = useState<"" | "preview" | "start" | "models">("");
@@ -69,9 +85,7 @@ export function SetupView({ client, health, initialSource, onStarted }: Props) {
     setBusy("start");
     setError(null);
     try {
-      const config: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(overrides)) if (v !== "") config[k] = v;
-      const run = await client.startRun({ source, config, sample_rows: sample, name });
+      const run = await client.startRun({ source, config: activeOverrides(), sample_rows: sample, name });
       localStorage.setItem(LS_KEY, JSON.stringify(source));
       onStarted(run, source);
     } catch (e) {
@@ -85,7 +99,7 @@ export function SetupView({ client, health, initialSource, onStarted }: Props) {
     setBusy("models");
     setModelsMsg(null);
     try {
-      const r = await client.prefetchModels();
+      const r = await client.prefetchModels(activeOverrides());
       setModelsMsg(`Ready · embedding: ${r.embedding} · reranker: ${r.reranker}`);
     } catch (e) {
       setModelsMsg(e instanceof Error ? e.message : String(e));
@@ -102,6 +116,10 @@ export function SetupView({ client, health, initialSource, onStarted }: Props) {
     "fuzzy_auto_threshold", "fuzzy_review_threshold", "embed_auto_threshold", "embed_high_threshold",
     "embed_medium_threshold", "cluster_sim_threshold", "cluster_merge_threshold", "lead_bank_threshold",
     "advanced_cross_encoder_enabled", "embedding_backend", "cpu_threads",
+  ];
+  const modelSettings: Array<[key: string, hint: string]> = [
+    ["model_dir", "Offline model folder or network share (\\\\server\\share\\ucc-models). Nothing is downloaded when set."],
+    ["model_cache_dir", "Where models are downloaded when no model folder is set."],
   ];
 
   return (
@@ -172,18 +190,29 @@ export function SetupView({ client, health, initialSource, onStarted }: Props) {
         </div>
 
         <button className="link" onClick={() => setAdvanced((a) => !a)}>
-          {advanced ? "Hide" : "Show"} advanced thresholds
+          {advanced ? "Hide" : "Show"} advanced settings
         </button>
         {advanced && (
-          <div className="grid3">
-            {tunables.map((k) => (
+          <>
+            <div className="grid3">
+              {tunables.map((k) => (
+                <label className="field" key={k}>
+                  <span>{k}</span>
+                  <input value={overrides[k] ?? ""} placeholder={String(defaults[k] ?? "")}
+                    onChange={(e) => updateOverride(k, e.target.value)} />
+                </label>
+              ))}
+            </div>
+            <h3 className="subhead">Model location</h3>
+            {modelSettings.map(([k, hint]) => (
               <label className="field" key={k}>
                 <span>{k}</span>
                 <input value={overrides[k] ?? ""} placeholder={String(defaults[k] ?? "")}
-                  onChange={(e) => setOverrides({ ...overrides, [k]: e.target.value })} />
+                  onChange={(e) => updateOverride(k, e.target.value)} />
+                <small className="muted">{hint}</small>
               </label>
             ))}
-          </div>
+          </>
         )}
       </section>
 

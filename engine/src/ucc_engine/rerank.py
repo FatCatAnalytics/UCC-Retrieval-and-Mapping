@@ -36,13 +36,12 @@ class FastEmbedReranker(_SharedModel):
     def __init__(self, model_name: str, cache_dir: str, model_dir: str = "", threads: int = 0):
         from fastembed.rerank.cross_encoder import TextCrossEncoder  # lazy
 
+        from .embeddings import fastembed_location
+
         name = _FASTEMBED_RERANKERS.get(model_name, model_name)
-        kwargs: dict[str, Any] = {"model_name": name, "cache_dir": cache_dir}
+        kwargs: dict[str, Any] = {"model_name": name, **fastembed_location(cache_dir, model_dir)}
         if threads > 0:
             kwargs["threads"] = threads
-        if model_dir:
-            kwargs["specific_model_path"] = model_dir
-            kwargs["local_files_only"] = True
         self._model = TextCrossEncoder(**kwargs)
         self.model_id = f"fastembed:{name}"
 
@@ -65,7 +64,10 @@ class SentenceTransformerReranker(_SharedModel):
     def __init__(self, model_name: str, cache_dir: str, model_dir: str = "", threads: int = 0):
         from sentence_transformers import CrossEncoder  # lazy
 
-        self._model = CrossEncoder(model_dir or model_name, device="cpu", max_length=128)
+        self._model = CrossEncoder(
+            model_name, device="cpu", max_length=128, cache_folder=model_dir or cache_dir or None,
+            local_files_only=bool(model_dir),
+        )
         self.model_id = f"st:{model_name}"
 
     def score(self, pairs: Sequence[Sequence[str]]) -> List[float]:

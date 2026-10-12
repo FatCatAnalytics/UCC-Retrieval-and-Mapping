@@ -72,6 +72,20 @@ class _SharedModel:
         raise TypeError(f"{type(self).__name__} is a process-local model and cannot be pickled")
 
 
+def fastembed_location(cache_dir: str, model_dir: str = "") -> dict[str, Any]:
+    """Where fastembed should look for model files.
+
+    ``model_dir`` is an *offline* model folder in the normal cache layout
+    (``models--Qdrant--bge-small-en-v1.5-onnx-Q/``, ``models--Xenova--ms-marco-MiniLM-L-6-v2/``
+    - exactly what ``ucc-engine prefetch-models`` writes). It may be a network
+    share / UNC path; the files are only ever read. With it set, nothing is
+    downloaded. Without it, ``cache_dir`` is used and missing models download.
+    """
+    if model_dir:
+        return {"cache_dir": model_dir, "local_files_only": True}
+    return {"cache_dir": cache_dir}
+
+
 class FastEmbedBackend(_SharedModel):
     """``fastembed.TextEmbedding`` wrapped to look like ``SentenceTransformer``."""
 
@@ -79,12 +93,9 @@ class FastEmbedBackend(_SharedModel):
         from fastembed import TextEmbedding  # lazy: heavy import
 
         name = _FASTEMBED_ALIASES.get(model_name, model_name)
-        kwargs: dict[str, Any] = {"model_name": name, "cache_dir": cache_dir}
+        kwargs: dict[str, Any] = {"model_name": name, **fastembed_location(cache_dir, model_dir)}
         if threads > 0:
             kwargs["threads"] = threads
-        if model_dir:
-            kwargs["specific_model_path"] = model_dir
-            kwargs["local_files_only"] = True
         self._model = TextEmbedding(**kwargs)
         self.model_id = f"fastembed:{name}"
         self._dim: int | None = None
@@ -125,8 +136,9 @@ class SentenceTransformerBackend(_SharedModel):
                 torch.set_num_threads(threads)
             except Exception:  # noqa: BLE001
                 pass
-        source = model_dir or model_name
-        self._model = SentenceTransformer(source, device="cpu", cache_folder=cache_dir or None)
+        self._model = SentenceTransformer(
+            model_name, device="cpu", cache_folder=model_dir or cache_dir or None, local_files_only=bool(model_dir)
+        )
         self.model_id = f"st:{model_name}"
 
     def encode(self, texts: Any, batch_size: int = 256, normalize_embeddings: bool = False, **_ignored) -> np.ndarray:
@@ -188,7 +200,11 @@ def load_embedding_model(config: Any, context: Any = None):
 
     model = _MODEL_CACHE.get(key)
     if model is None:
-        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        if model_dir:
+            if not Path(model_dir).is_dir():
+                raise FileNotFoundError(f"model_dir {model_dir!r} does not exist or is not reachable")
+        else:
+            Path(cache_dir).mkdir(parents=True, exist_ok=True)
         if context is not None:
             context.log.info(f"Loading embedding model {model_name!r} via {backend} (local CPU)")
         cls = FastEmbedBackend if backend == "fastembed" else SentenceTransformerBackend
