@@ -62,6 +62,10 @@ lead-bank files) and `run.json` (status, timings, summary, log tail).
 | `GET /runs/{id}/review` | paged review queue (`confidence`, `search`, `method`, `decision` = `pending`/`approved`/`rejected`, `offset`, `limit`); each row carries its `key` and current decision |
 | `GET/PUT /runs/{id}/decisions` | read / record review decisions: `{items: [{key, decision: "approved"\|"rejected"\|null, mapped_name?, firm_id?}]}` |
 | `POST /runs/{id}/apply-decisions` | append approved rows to a fresh `updated_master_<ts>.csv` (`_source = reviewed_approved`) |
+| `GET /decisions` | the decisions database across all runs (`decision`, `search`, `run_id`, `offset`, `limit`) |
+| `POST /decisions/clear` | `{keys: [...]}` – undo decisions (they become "to decide" again) |
+| `GET /decisions/history?key=` | audit log for one key |
+| `GET/POST /decisions/export` | CSV of all decisions (download / `{destination}` to write a file) |
 | `GET /runs/{id}/clusters` | new-entity clusters, one row per cluster |
 | `GET /runs/{id}/outputs[/{name}]` | list / download output files |
 | `POST /runs/{id}/promote-master` | apply any pending approvals, then copy this run's `updated_master` over a destination (timestamped backup kept) |
@@ -71,12 +75,27 @@ lead-bank files) and `run.json` (status, timings, summary, log tail).
 
 Rows in the `REVIEW_*` confidence bands are suggestions, not facts, so they are
 *not* added to the updated master automatically. The reviewer approves (optionally
-after correcting the mapped name), rejects, or leaves them pending; decisions are
-keyed by `DEBT_STATE|SECP_STATE|SECP_NAME` and persisted in the run's
-`decisions.json`, so they survive an engine restart. Approving writes
-`SECP_NAME → mapped name (Firm ID)`; the Firm ID is looked up in the Universe by
-the final mapped name and left blank if that name is unknown. Original master and
-pipeline (Stage 1–3) rows always win over an approved row with the same key.
+after correcting the mapped name), rejects, or leaves them pending.
+
+Decisions are keyed by `DEBT_STATE|SECP_STATE|SECP_NAME` and stored in one SQLite
+database shared by every run, `<engine home>/decisions.sqlite` (tables
+`decisions` – current state – and `decision_log` – append-only audit). Stdlib
+`sqlite3`, nothing extra to install; open it with any SQLite viewer. Consequences:
+
+- A key decided in any run is never "to decide" again; later runs show it as
+  approved / rejected with the run it was decided in.
+- A rejection is of a *specific suggestion*. If a later run proposes a different
+  mapped name for the same key, that row comes back as pending with
+  `previously_rejected` set, so the new suggestion gets looked at once.
+- Approved rows are carried into every later run's updated master automatically
+  (at run end, and on `apply-decisions` / `promote-master`) until the promoted
+  Master Mapping contains them, after which Stage 1 matches them exactly.
+- Approving writes `SECP_NAME → mapped name (Firm ID)`; the Firm ID is looked up
+  in the Universe by the final mapped name and left blank if that name is
+  unknown. Original master and pipeline (Stage 1–3) rows always win over an
+  approved row with the same key.
+- A per-run `decisions.json` from older engine versions is imported into the
+  database the first time the run is loaded (renamed `.json.imported`).
 
 ## Configuration
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
@@ -43,6 +44,14 @@ class DecisionsRequest(BaseModel):
     items: List[DecisionItem] = Field(..., min_length=1)
 
 
+class ClearDecisionsRequest(BaseModel):
+    keys: List[str] = Field(..., min_length=1)
+
+
+class ExportRequest(BaseModel):
+    destination: str = Field("", description="CSV path to write; empty = the engine's exports folder")
+
+
 def create_app(store: Optional[RunStore] = None) -> FastAPI:
     store = store or RunStore()
     app = FastAPI(title="UCC Mapping Engine", version=__version__)
@@ -59,6 +68,8 @@ def create_app(store: Optional[RunStore] = None) -> FastAPI:
             "version": __version__,
             "pid": os.getpid(),
             "data_dir": str(app_data_dir()),
+            "decisions_db": str(store.decisions.path),
+            "decisions": store.decisions.counts(),
             "backends": available_backends(),
             "active_run": active.id if active else None,
         }
@@ -149,8 +160,7 @@ def create_app(store: Optional[RunStore] = None) -> FastAPI:
     # ----------------------------------------------------- review decisions
     @app.get("/runs/{run_id}/decisions")
     def runs_decisions(run_id: str) -> Dict[str, Any]:
-        run = _get(run_id)
-        return {"counts": run.decision_counts(), "decisions": run.decisions}
+        return {"counts": _get(run_id).decision_counts()}
 
     @app.put("/runs/{run_id}/decisions")
     def runs_set_decisions(run_id: str, req: DecisionsRequest) -> Dict[str, Any]:
@@ -169,6 +179,46 @@ def create_app(store: Optional[RunStore] = None) -> FastAPI:
             raise HTTPException(404, str(e)) from e
         except RuntimeError as e:
             raise HTTPException(409, str(e)) from e
+
+    # ------------------------------------------- the decisions database (all runs)
+    @app.get("/decisions")
+    def decisions_list(
+        decision: Literal["", "approved", "rejected"] = "",
+        search: str = "",
+        run_id: str = "",
+        offset: int = Query(0, ge=0),
+        limit: int = Query(100, ge=1, le=1000),
+        sort: str = "decided_at",
+        descending: bool = True,
+    ) -> Dict[str, Any]:
+        return store.decisions.list(decision=decision, search=search, run_id=run_id, offset=offset,
+                                    limit=limit, sort=sort, descending=descending)
+
+    @app.post("/decisions/clear")
+    def decisions_clear(req: ClearDecisionsRequest) -> Dict[str, Any]:
+        cleared = sum(store.decisions.clear(k) for k in req.keys)
+        return {"cleared": cleared, "counts": store.decisions.counts()}
+
+    @app.get("/decisions/history")
+    def decisions_history(key: str) -> List[Dict[str, Any]]:
+        return store.decisions.history(key)
+
+    def _export_path(destination: str = "") -> Path:
+        path = Path(destination).expanduser() if destination else (
+            store.decisions.path.parent / "exports" / f"review_decisions_{datetime.now():%Y%m%d_%H%M%S}.csv")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @app.get("/decisions/export")
+    def decisions_export() -> FileResponse:
+        path = _export_path()
+        store.decisions.export_csv(path)
+        return FileResponse(path, filename=path.name, media_type="text/csv")
+
+    @app.post("/decisions/export")
+    def decisions_export_to(req: ExportRequest) -> Dict[str, Any]:
+        path = _export_path(req.destination)
+        return {"path": str(path), "rows": store.decisions.export_csv(path)}
 
     @app.get("/runs/{run_id}/clusters")
     def runs_clusters(

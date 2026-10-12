@@ -150,7 +150,7 @@ def test_clustering_stages_are_skipped_by_default_but_keep_the_dag_wired():
     assert out.attrs == {} and df.attrs  # input untouched, output carries no model handle
 
 
-def _fake_finished_run(tmp_path: Path):
+def _fake_finished_run(tmp_path: Path, name: str = "t", suggestions: dict | None = None):
     """A succeeded run with an in-memory results frame + updated master, no models involved."""
     from ucc_engine.config import PipelineConfig
     from ucc_engine.datasources import CsvSourceSpec
@@ -159,13 +159,14 @@ def _fake_finished_run(tmp_path: Path):
     universe = tmp_path / "universe.csv"
     universe.write_text("Bank Name,Firm ID\nAcme Bank,101\nZeta Bank,202\n")
     spec = CsvSourceSpec(ucc_path=str(tmp_path / "u.csv"), master_path=str(tmp_path / "m.csv"), universe_path=str(universe))
-    run = PipelineRun(spec, PipelineConfig(), runs_root=tmp_path / "runs", name="t")
+    run = PipelineRun(spec, PipelineConfig(), runs_root=tmp_path / "runs", name=name)
     run.config.universe_file = str(universe)
     run.status = "succeeded"
+    mapped = {"ACME BK NA": "Acme Bank", "ZETA BANK TRUSTEE": "Zeta Bank", "OTHER CO": "Unknown Co", "KNOWN": "Known"}
+    mapped.update(suggestions or {})
     results = pd.DataFrame({
         "DEBT_STATE": ["ca", "NY", "TX", "FL"], "SECP_STATE": ["CA", "NY", "TX", "FL"],
-        "SECP_NAME": ["ACME BK NA", "ZETA BANK TRUSTEE", "OTHER CO", "KNOWN"],
-        "SECP_NAME_MAPPED": ["Acme Bank", "Zeta Bank", "Unknown Co", "Known"],
+        "SECP_NAME": list(mapped), "SECP_NAME_MAPPED": list(mapped.values()),
         "match_method": ["Advanced Match"] * 3 + ["Exact Match (Raw)"],
         "match_score": [0.91, 0.88, 0.86, 1.0],
         "confidence": ["REVIEW_HIGH", "REVIEW_MEDIUM", "REVIEW_LOW", "AUTO"],
@@ -197,8 +198,11 @@ def test_review_decisions_flow_into_updated_master(tmp_path: Path):
         {"key": k_other, "decision": "approved", "mapped_name": "Zeta Bank"},
         {"key": k_zeta, "decision": "rejected"},
     ])
-    assert out["counts"] == {"approved": 2, "rejected": 1, "pending": 0, "applied": 0, "unapplied_approved": 2}
-    assert run.decisions[k_other]["firm_id"] == 202 and run.decisions[k_acme]["firm_id"] == 101
+    counts = {k: v for k, v in out["counts"].items() if k != "store"}
+    assert counts == {"approved": 2, "rejected": 1, "pending": 0, "total": 3, "unapplied_approved": 2}
+    assert out["counts"]["store"] == {"approved": 2, "rejected": 1, "total": 3}
+    assert run.decisions.get(k_other)["firm_id"] == 202 and run.decisions.get(k_acme)["firm_id"] == 101
+    assert run.decisions.get(k_other)["run_id"] == run.id
     assert run.review(decision="approved")["total"] == 2 and run.review(decision="pending")["total"] == 0
     with pytest.raises(KeyError):
         run.set_decisions([{"key": "FL|FL|KNOWN", "decision": "approved"}])  # AUTO row is not reviewable
@@ -222,21 +226,81 @@ def test_review_decisions_flow_into_updated_master(tmp_path: Path):
     latest = pd.read_csv(run._latest("updated_master_*.csv", exclude="_with_source"))
     assert len(latest) == 3
     run._persist()
-    restored = PipelineRun.load(run.run_dir)
-    assert restored is not None and restored.decisions.keys() == run.decisions.keys()
+    restored = PipelineRun.load(run.run_dir)  # fresh store object on the same file
+    assert restored is not None and restored.decisions.counts()["approved"] == 2
 
     # clearing a decision
     run.set_decisions([{"key": k_zeta, "decision": None}])
     assert run.decision_counts()["pending"] == 1
+    assert [h["action"] for h in run.decisions.history(k_zeta)] == ["cleared", "rejected"]
 
     # a corrected name that is not in the Universe gets a blank Firm ID (not the suggestion's),
     # and the blank must not demote the column to floats ("101.0") in the CSV
     run.set_decisions([{"key": k_zeta, "decision": "approved", "mapped_name": "Unknown Bank"}])
-    assert run.decisions[k_zeta]["firm_id"] is None
+    assert run.decisions.get(k_zeta)["firm_id"] is None
     run.apply_decisions()
     text = Path(run._latest("updated_master_*.csv", exclude="_with_source")).read_text()
     assert ",101\n" in text and ".0" not in text
     assert any(line.endswith(",Unknown Bank,") for line in text.splitlines())
+
+
+def test_decisions_carry_across_runs(tmp_path: Path):
+    """Decided keys are not reviewed again; approvals flow into later runs' masters; rejections are per suggestion."""
+    from ucc_engine.decisions import DecisionStore
+    from ucc_engine.runner import PipelineRun
+
+    first = _fake_finished_run(tmp_path, "first")
+    assert first.decisions.path == tmp_path / "decisions.sqlite"
+    first.set_decisions([
+        {"key": "CA|CA|ACME BK NA", "decision": "approved"},
+        {"key": "NY|NY|ZETA BANK TRUSTEE", "decision": "rejected"},
+    ])
+    # nothing applied yet in run 1 - the approval is still "owed" to the master
+    assert first.decision_counts()["unapplied_approved"] == 1
+
+    # run 2 (same store): the pipeline makes the same suggestions again, except OTHER CO
+    second = _fake_finished_run(tmp_path, "second", suggestions={"OTHER CO": "Other Bank"})
+    assert second.decisions is first.decisions
+    rows = {r["key"]: r for r in second.review()["rows"]}
+    assert rows["CA|CA|ACME BK NA"]["decision"] == "approved"
+    assert rows["NY|NY|ZETA BANK TRUSTEE"]["decision"] == "rejected"
+    assert rows["TX|TX|OTHER CO"]["decision"] is None
+    assert second.review(decision="pending")["total"] == 1  # only the never-reviewed row is left to decide
+    assert rows["CA|CA|ACME BK NA"]["decided_in_run"] == first.id
+
+    # the run-end hook carries the earlier approval into run 2's updated master
+    second._carry_forward_approvals()
+    latest = pd.read_csv(second._latest("updated_master_*_with_source.csv"))
+    assert latest.set_index("SECP_NAME").loc["ACME BK NA", "_source"] == "reviewed_approved"
+    assert second.decision_counts()["unapplied_approved"] == 0
+    assert second.summary["updated_master"]["approved_rows"] == 1
+
+    # a rejection is tied to the suggestion: a *different* suggestion comes back for review, with the history shown
+    second.set_decisions([{"key": "TX|TX|OTHER CO", "decision": "rejected"}])
+    third = _fake_finished_run(tmp_path, "third", suggestions={"OTHER CO": "Completely Different Bank"})
+    other = {r["key"]: r for r in third.review()["rows"]}["TX|TX|OTHER CO"]
+    assert other["decision"] is None and other["previously_rejected"] == "Other Bank"
+    # ...while the same suggestion (ignoring case/spacing) stays hidden
+    fourth = _fake_finished_run(tmp_path, "fourth", suggestions={"OTHER CO": "  other   BANK "})
+    assert {r["key"]: r for r in fourth.review()["rows"]}["TX|TX|OTHER CO"]["decision"] == "rejected"
+
+    # global listing / export / clear
+    store: DecisionStore = first.decisions
+    listing = store.list(decision="rejected", search="other")
+    assert listing["total"] == 1 and listing["rows"][0]["key"] == "TX|TX|OTHER CO"
+    out = tmp_path / "decisions.csv"
+    assert store.export_csv(out) == 3 and out.read_text().startswith("key,debt_state,secp_state,secp_name,decision")
+    assert store.clear("TX|TX|OTHER CO") and not store.clear("TX|TX|OTHER CO")
+    assert store.counts() == {"approved": 1, "rejected": 1, "total": 2}
+
+    # a pre-SQLite decisions.json next to a run is imported once on load
+    legacy_run = _fake_finished_run(tmp_path, "legacy")
+    legacy_run._persist()
+    (legacy_run.run_dir / "decisions.json").write_text(
+        '{"TX|TX|OTHER CO": {"decision": "approved", "suggested": "Unknown Co", "mapped_name": null, "firm_id": 7}}')
+    loaded = PipelineRun.load(legacy_run.run_dir, decisions=store)
+    assert loaded is not None and store.get("TX|TX|OTHER CO")["firm_id"] == 7
+    assert not (legacy_run.run_dir / "decisions.json").exists()
 
 
 def test_api_health_and_validation(tmp_path: Path):
@@ -246,7 +310,11 @@ def test_api_health_and_validation(tmp_path: Path):
     from ucc_engine.runner import RunStore
 
     client = TestClient(create_app(RunStore(tmp_path / "runs")))
-    assert client.get("/health").json()["status"] == "ok"
+    health = client.get("/health").json()
+    assert health["status"] == "ok" and health["decisions"] == {"approved": 0, "rejected": 0, "total": 0}
+    assert client.get("/decisions").json()["total"] == 0
+    assert client.post("/decisions/clear", json={"keys": ["X|X|NOPE"]}).json()["cleared"] == 0
+    assert client.get("/decisions/export").headers["content-type"].startswith("text/csv")
     assert client.get("/config/defaults").json()["defaults"]["fuzzy_auto_threshold"] == 96
     assert client.get("/runs/nope").status_code == 404
     r = client.post("/runs", json={"source": {"type": "csv", "ucc_path": "/nope.csv", "master_path": "/nope2.csv"}, "sample_rows": -1})

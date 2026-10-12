@@ -73,12 +73,45 @@ export interface Page {
 
 export type Decision = "approved" | "rejected";
 
+/** Decision status of one run's review rows (+ what the master still lacks, + the global store totals). */
 export interface DecisionCounts {
   approved: number;
   rejected: number;
   pending: number;
-  applied: number;
+  total: number;
   unapplied_approved: number;
+  store: StoreCounts;
+}
+
+export interface StoreCounts {
+  approved: number;
+  rejected: number;
+  total: number;
+}
+
+/** One row of the decisions database. */
+export interface DecisionRecord {
+  key: string;
+  debt_state: string | null;
+  secp_state: string | null;
+  secp_name: string;
+  decision: Decision;
+  suggested: string | null;
+  mapped_name: string | null;
+  firm_id: number | null;
+  match_method: string | null;
+  match_score: number | null;
+  confidence: string | null;
+  run_id: string | null;
+  decided_at: string;
+}
+
+export interface DecisionsPage {
+  total: number;
+  offset: number;
+  limit: number;
+  rows: DecisionRecord[];
+  counts: StoreCounts;
 }
 
 export interface DecisionItem {
@@ -124,6 +157,8 @@ export interface Health {
   version: string;
   pid: number;
   data_dir: string;
+  decisions_db: string;
+  decisions: StoreCounts;
   backends: Record<string, boolean>;
   active_run: string | null;
 }

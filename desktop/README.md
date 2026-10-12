@@ -13,10 +13,14 @@ Tauri 2 shell (Rust) + React/TypeScript UI around the Python engine in
    match-method and confidence breakdowns, stage timings), the **review queue**
    where you approve, correct-then-approve, or reject each suggestion (approved
    rows are appended to the updated master with **Add N approved to updated
-   master**; decisions persist per run), new-entity clusters when clustering is
-   on, the output files, and **Promote as new master** (applies pending approvals,
-   then copies the run's `updated_master_*.csv` over your Master Mapping file,
-   keeping a timestamped backup).
+   master**), new-entity clusters when clustering is on, the output files, and
+   **Promote as new master** (applies pending approvals, then copies the run's
+   `updated_master_*.csv` over your Master Mapping file, keeping a timestamped
+   backup).
+4. **Decisions** (sidebar) - the decisions database across all runs: every
+   approve / reject with who-what-when, search, undo, CSV export. Decided filers
+   are skipped in future review queues ("To decide" only ever shows what nobody
+   has looked at); approved mappings flow into later runs' updated masters.
 
 No LLM and no network inference: the two small models run on the local CPU.
 

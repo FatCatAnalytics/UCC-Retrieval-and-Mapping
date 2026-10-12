@@ -50,6 +50,22 @@ code { font-family: var(--mono); font-size: 12px; }
 .run-item .run-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-item .small { grid-column: 2; }
 .sidebar-footer { border-top: 1px solid var(--line); padding-top: 10px; }
+.nav-item { display: flex; flex-direction: column; gap: 2px; text-align: left; background: none; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; color: var(--text); font: inherit; font-weight: 600; cursor: pointer; }
+.nav-item:hover { background: var(--bg); }
+.nav-item.active { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.nav-item .small { font-weight: 400; }
+.warn { color: var(--warn, #b26a00); }
+.table.decisions { table-layout: fixed; }
+.table.decisions th:nth-child(1) { width: 118px; }
+.table.decisions th:nth-child(2) { width: 21%; }
+.table.decisions th:nth-child(3) { width: 64px; }
+.table.decisions th:nth-child(4) { width: 90px; }
+.table.decisions th:nth-child(6) { width: 58px; }
+.table.decisions th:nth-child(7) { width: 132px; }
+.table.decisions th:nth-child(8) { width: 112px; }
+.table.decisions th:nth-child(9) { width: 48px; }
+.table.decisions td { vertical-align: top; }
+.table.decisions tr.decided.rejected { opacity: .75; }
 
 .content { overflow: auto; }
 .page { padding: 22px 28px 40px; max-width: 1200px; display: flex; flex-direction: column; gap: 16px; }

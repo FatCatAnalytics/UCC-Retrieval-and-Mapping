@@ -13,11 +13,15 @@ const BANDS = ["REVIEW_HIGH", "REVIEW_MEDIUM", "REVIEW_LOW"];
 export function ResultsView({ client, run }: Props) {
   const [tab, setTab] = useState<Tab>("summary");
   const [summary, setSummary] = useState<Summary | null>(run.summary);
+  const [pending, setPending] = useState<number | null>(null);
 
   useEffect(() => {
     setSummary(run.summary);
     if (!run.summary && run.status === "succeeded") client.summary(run.id).then(setSummary).catch(() => {});
   }, [client, run.id, run.summary, run.status]);
+  useEffect(() => {
+    client.decisions(run.id).then((d) => setPending(d.counts.pending)).catch(() => setPending(null));
+  }, [client, run.id, tab]);
 
   return (
     <div className="page">
@@ -33,7 +37,7 @@ export function ResultsView({ client, run }: Props) {
         {(["summary", "review", "clusters", "outputs"] as Tab[]).filter((t) => t !== "clusters" || !summary || summary.clusters > 0).map((t) => (
           <button key={t} className={tab === t ? "on" : ""} onClick={() => setTab(t)}>
             {t === "summary" && "Summary"}
-            {t === "review" && `Review queue${summary ? ` (${summary.review_needed.toLocaleString()})` : ""}`}
+            {t === "review" && `Review queue${pending != null ? ` (${pending.toLocaleString()} to decide)` : summary ? ` (${summary.review_needed.toLocaleString()})` : ""}`}
             {t === "clusters" && `New-entity clusters${summary ? ` (${summary.clusters.toLocaleString()})` : ""}`}
             {t === "outputs" && "Output files"}
           </button>
@@ -80,7 +84,8 @@ function SummaryTab({ run, summary, client }: { run: RunSnapshot; summary: Summa
       <div className="cards">
         <Stat label="UCC records" value={summary.total_records} />
         <Stat label="Auto-mapped" value={summary.auto_mapped} sub={pct(summary.auto_mapped)} tone="good" />
-        <Stat label="Review needed" value={summary.review_needed} sub={pct(summary.review_needed)} tone="warn" />
+        <Stat label="Review needed" value={summary.review_needed}
+          sub={counts && counts.pending !== summary.review_needed ? `${counts.pending.toLocaleString()} still to decide` : pct(summary.review_needed)} tone="warn" />
         <Stat label="New entities" value={summary.new_entities}
           sub={summary.clusters > 0 ? `${summary.clusters.toLocaleString()} clusters` : `${pct(summary.new_entities)} · not in master`} />
         <Stat label="With Firm ID" value={summary.records_with_firm_id} sub={`${summary.unique_firm_ids.toLocaleString()} firms`} />
@@ -124,10 +129,10 @@ function SummaryTab({ run, summary, client }: { run: RunSnapshot; summary: Summa
             {busy ? "Promoting…" : "Promote as new master"}
           </button>
         </div>
-        {counts && (counts.approved || counts.rejected || counts.pending) ? (
+        {counts && counts.total ? (
           <p className="small muted">
-            Review queue: {counts.approved} approved{pendingApproved ? ` (${pendingApproved} not yet added — promoting adds them)` : ""},{" "}
-            {counts.rejected} rejected, {counts.pending} still to decide.
+            Review queue: {counts.approved} approved, {counts.rejected} rejected (incl. decisions from earlier runs), {counts.pending} still to decide.
+            {pendingApproved ? ` ${pendingApproved} approved row(s) are not in this file yet — promoting adds them.` : ""}
           </p>
         ) : null}
         {msg && <p className="small">{msg}</p>}
@@ -176,7 +181,7 @@ type DecisionFilter = "" | "pending" | "approved" | "rejected";
 function ReviewTab({ run, client }: { run: RunSnapshot; client: EngineClient }) {
   const [bands, setBands] = useState<string[]>(BANDS);
   const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState<DecisionFilter>("");
+  const [filter, setFilter] = useState<DecisionFilter>("pending");
   const [page, setPage] = useState<Page | null>(null);
   const [offset, setOffset] = useState(0);
   const [tick, setTick] = useState(0);
@@ -252,7 +257,8 @@ function ReviewTab({ run, client }: { run: RunSnapshot; client: EngineClient }) 
       <div className="row between wrap decision-bar">
         <span className="small muted">
           Approve a suggestion to add <em>SECP_NAME → mapped name (Firm ID)</em> to the updated master. Edit the mapped name first if the
-          suggestion is close but not right; the Firm ID is re-looked-up from the Universe.
+          suggestion is close but not right; the Firm ID is re-looked-up from the Universe. Decisions are remembered across runs:
+          anything you approve or reject here stays out of "To decide" in every later run.
         </span>
         <div className="row gap">
           <button className="btn" disabled={busy !== "" || undecidedShown.length === 0}
@@ -291,6 +297,11 @@ function ReviewTab({ run, client }: { run: RunSnapshot; client: EngineClient }) 
                       disabled={decision === "approved" || busy !== ""}
                       onChange={(e) => { const v = e.target.value; setEdits((prev) => ({ ...prev, [key]: v })); }} />
                     {r.decided_mapped_name ? <div className="small muted">suggested: {suggested}</div> : null}
+                    {r.previously_rejected ? (
+                      <div className="small warn" title="A different suggestion for this filer was rejected before; this one is new.">
+                        previously rejected: {str(r.previously_rejected)}
+                      </div>
+                    ) : null}
                   </td>
                   <td className="small">
                     <div>{str(r.match_method)}</div>
@@ -304,7 +315,9 @@ function ReviewTab({ run, client }: { run: RunSnapshot; client: EngineClient }) 
                   <td>
                     {decision ? (
                       <div className="row gap">
-                        <span className={`pill ${decision}`}>{decision}</span>
+                        <span className={`pill ${decision}`} title={r.decided_in_run && r.decided_in_run !== run.id ? `decided in run ${str(r.decided_in_run)}` : undefined}>
+                          {decision}{r.decided_in_run && r.decided_in_run !== run.id ? " ·  earlier run" : ""}
+                        </span>
                         <button className="link small" disabled={busy !== ""} onClick={() => decide([{ key, decision: null }])}>undo</button>
                       </div>
                     ) : (

@@ -4,8 +4,9 @@ import type { Health, RunSnapshot, SourceSpec } from "./types";
 import { SetupView } from "./views/SetupView";
 import { RunView } from "./views/RunView";
 import { ResultsView } from "./views/ResultsView";
+import { DecisionsView } from "./views/DecisionsView";
 
-type View = "setup" | "run" | "results";
+type View = "setup" | "run" | "results" | "decisions";
 
 export default function App() {
   const [client, setClient] = useState<EngineClient | null>(null);
@@ -47,8 +48,9 @@ export default function App() {
   const refreshRuns = useCallback(async () => {
     if (!client) return;
     try {
-      const list = await client.listRuns();
+      const [list, h] = await Promise.all([client.listRuns(), client.health()]);
       setRuns(list);
+      setHealth(h);
       if (!selected && list[0]) setSelected(list[0].id);
     } catch {
       /* transient */
@@ -122,6 +124,12 @@ export default function App() {
             </button>
           ))}
         </div>
+        <button className={`nav-item ${view === "decisions" ? "active" : ""}`} onClick={() => setView("decisions")}>
+          <span>Decisions</span>
+          <span className="muted small">
+            {health?.decisions ? `${health.decisions.approved.toLocaleString()} approved · ${health.decisions.rejected.toLocaleString()} rejected` : "—"}
+          </span>
+        </button>
         <footer className="sidebar-footer muted small">
           engine v{health?.version} · {health?.backends.fastembed ? "fastembed" : "sentence-transformers"} · local
           CPU
@@ -144,6 +152,9 @@ export default function App() {
           />
         )}
         {view === "results" && selectedRun && <ResultsView client={client} run={selectedRun} />}
+        {view === "decisions" && (
+          <DecisionsView client={client} health={health} runs={runs} onOpenRun={(id) => { setSelected(id); setView("results"); }} />
+        )}
         {(view === "run" || view === "results") && !selectedRun && (
           <div className="empty">Select a run from the left, or start a new one.</div>
         )}

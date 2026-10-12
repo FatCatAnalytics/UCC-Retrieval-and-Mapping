@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  ApplyResult, DecisionCounts, DecisionItem, Health, LogLine, OutputFile, Page, RunSnapshot, SourcePreview, SourceSpec, Summary,
+  ApplyResult, DecisionCounts, DecisionItem, DecisionsPage, Health, LogLine, OutputFile, Page, RunSnapshot,
+  SourcePreview, SourceSpec, StoreCounts, Summary,
 } from "./types";
 
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -91,10 +92,26 @@ export class EngineClient {
     return this.req<Page>(`/runs/${id}/clusters?${p}`);
   };
 
-  decisions = (id: string) => this.req<{ counts: DecisionCounts; decisions: Record<string, unknown> }>(`/runs/${id}/decisions`);
+  decisions = (id: string) => this.req<{ counts: DecisionCounts }>(`/runs/${id}/decisions`);
   setDecisions = (id: string, items: DecisionItem[]) =>
     this.req<{ changed: number; counts: DecisionCounts }>(`/runs/${id}/decisions`, { method: "PUT", body: JSON.stringify({ items }) });
   applyDecisions = (id: string) => this.req<ApplyResult>(`/runs/${id}/apply-decisions`, { method: "POST" });
+
+  // The decisions database (every run)
+  allDecisions = (q: { decision?: string; search?: string; run_id?: string; offset?: number; limit?: number }) => {
+    const p = new URLSearchParams();
+    if (q.decision) p.set("decision", q.decision);
+    if (q.search) p.set("search", q.search);
+    if (q.run_id) p.set("run_id", q.run_id);
+    p.set("offset", String(q.offset ?? 0));
+    p.set("limit", String(q.limit ?? 100));
+    return this.req<DecisionsPage>(`/decisions?${p}`);
+  };
+  clearDecisions = (keys: string[]) =>
+    this.req<{ cleared: number; counts: StoreCounts }>("/decisions/clear", { method: "POST", body: JSON.stringify({ keys }) });
+  decisionsExportUrl = () => `${this.base}/decisions/export`;
+  exportDecisions = (destination: string) =>
+    this.req<{ path: string; rows: number }>("/decisions/export", { method: "POST", body: JSON.stringify({ destination }) });
 
   promoteMaster = (id: string, destination: string) =>
     this.req<{ source: string; destination: string; backup: string | null }>(`/runs/${id}/promote-master`, {

@@ -24,6 +24,7 @@ import pandas as pd
 from .compat import AssetExecutionContext
 from .config import PipelineConfig, app_data_dir
 from .datasources import DataSource, SourceSpec, make_datasource, public_spec
+from .decisions import DECISIONS, DecisionStore, norm_name
 from .registry import KEEP_AFTER_RUN, PIPELINE, Stage, is_enabled, run_stage, total_weight
 
 REVIEW_BANDS = ("REVIEW_HIGH", "REVIEW_MEDIUM", "REVIEW_LOW")
@@ -36,7 +37,7 @@ REVIEW_COLUMNS = [
 MAX_LOG_LINES = 5000
 MASTER_KEY = ("DEBT_STATE", "SECP_STATE", "SECP_NAME")
 MASTER_COLUMNS = ("DEBT_STATE", "SECP_STATE", "SECP_NAME", "SECP_NAME_MAPPED", "Firm ID")
-DECISIONS = ("approved", "rejected")
+DECISION_COLUMNS = ("key", "decision", "decided_mapped_name", "decided_firm_id", "previously_rejected", "decided_in_run")
 
 
 def master_key(debt_state: Any, secp_state: Any, secp_name: Any) -> str:
@@ -106,6 +107,7 @@ class PipelineRun:
         sample_rows: int = 0,
         run_id: Optional[str] = None,
         name: str = "",
+        decisions: Optional[DecisionStore] = None,
     ):
         self.id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
         self.name = name or self.id
@@ -136,10 +138,11 @@ class PipelineRun:
         self._thread: Optional[threading.Thread] = None
         self._cache: Dict[str, Any] = {}
         self.summary: Optional[Dict[str, Any]] = None
-        # Reviewer decisions on the review queue, keyed by master_key(). Persisted
-        # separately from run.json so they survive restarts and are easy to audit.
-        self.decisions: Dict[str, Dict[str, Any]] = {}
-        self._decisions_path = self.run_dir / "decisions.json"
+        # Reviewer decisions live in one SQLite store shared by every run, so a key
+        # approved or rejected once is never asked about again.
+        self.decisions = decisions or DecisionStore.at(runs_root.parent / "decisions.sqlite")
+        self._legacy_decisions_path = self.run_dir / "decisions.json"
+        self._annotated: Optional[tuple[int, int, pd.DataFrame]] = None  # (store.version, id(enriched), frame)
         self._universe_lookup: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------ logging
@@ -191,6 +194,7 @@ class PipelineRun:
 
             self.summary = self._build_summary()
             self.status = "succeeded"
+            self._carry_forward_approvals()
             self._log("INFO", "Run complete.")
         except RunCancelled:
             self.status = "cancelled"
@@ -236,6 +240,16 @@ class PipelineRun:
         self._log("INFO", f"✓ {stage.label} in {state.seconds:.1f}s"
                           + (f" · {state.rows:,} rows" if state.rows is not None else ""), stage.name)
         self._persist()
+
+    def _carry_forward_approvals(self) -> None:
+        """Approvals from earlier runs that the master still lacks go straight into this run's updated master."""
+        try:
+            n = self.decision_counts()["unapplied_approved"]
+            if n:
+                self._log("INFO", f"Carrying forward {n:,} previously approved review rows into the updated master")
+                self.apply_decisions()
+        except Exception as e:  # noqa: BLE001 - never fail a finished run over this
+            self._log("WARNING", f"Could not carry forward approved decisions: {e}")
 
     def _release_memory(self) -> None:
         self._cache = {k: v for k, v in self._cache.items() if k in KEEP_AFTER_RUN}
@@ -348,9 +362,7 @@ class PipelineRun:
         descending: bool = True,
         decision: str = "",
     ) -> Dict[str, Any]:
-        df = self._enriched()
-        if df is None:
-            return {"total": 0, "rows": [], "offset": offset, "limit": limit}
+        df = self._annotated_review()
         bands = list(confidence) if confidence else list(REVIEW_BANDS)
         sub = df[df["confidence"].isin(bands)]
         if method:
@@ -364,25 +376,15 @@ class PipelineRun:
                 mask |= sub["suggested_mapping"].astype(str).str.contains(s, case=False, na=False, regex=False)
             sub = sub[mask]
         if decision:
-            keys = self._keys(sub)
-            if decision == "pending":
-                sub = sub[~keys.isin(self.decisions.keys()).values]
-            else:
-                chosen = {k for k, d in self.decisions.items() if d.get("decision") == decision}
-                sub = sub[keys.isin(chosen).values]
+            sub = sub[sub["decision"].eq(decision)]
         if sort in sub.columns:
             sub = sub.sort_values(sort, ascending=not descending, na_position="last")
-        cols = [c for c in REVIEW_COLUMNS if c in sub.columns]
-        page = sub.iloc[offset: offset + limit][cols]
-        rows = frame_records(page)
-        for row in rows:  # attach the reviewer's decision (if any) to each row
-            key = master_key(row.get("DEBT_STATE"), row.get("SECP_STATE"), row.get("SECP_NAME"))
-            row["key"] = key
-            d = self.decisions.get(key)
-            row["decision"] = d.get("decision") if d else None
-            row["decided_mapped_name"] = d.get("mapped_name") if d else None
-            row["decided_firm_id"] = d.get("firm_id") if d else None
-        return {"total": int(len(sub)), "offset": offset, "limit": limit, "columns": cols + ["key", "decision"],
+        cols = [c for c in REVIEW_COLUMNS if c in sub.columns] + list(DECISION_COLUMNS)
+        rows = frame_records(sub.iloc[offset: offset + limit][cols])
+        for row in rows:
+            if row["decision"] == "pending":
+                row["decision"] = None
+        return {"total": int(len(sub)), "offset": offset, "limit": limit, "columns": cols,
                 "rows": rows, "decision_counts": self.decision_counts()}
 
     # --------------------------------------------------------------- decisions
@@ -393,35 +395,73 @@ class PipelineRun:
             index=df.index, dtype="object",
         )
 
-    def _review_frame(self) -> pd.DataFrame:
+    def _annotated_review(self) -> pd.DataFrame:
+        """Review-band rows joined with the decision store.
+
+        ``decision`` is ``pending`` / ``approved`` / ``rejected``. An approval always
+        sticks to its key. A rejection only sticks while the pipeline keeps making the
+        *same* suggestion; a different suggestion comes back as pending with
+        ``previously_rejected`` naming the one that was turned down.
+        """
         df = self._enriched()
         if df is None:
-            return pd.DataFrame(columns=list(REVIEW_COLUMNS))
-        return df[df["confidence"].isin(REVIEW_BANDS)]
+            return pd.DataFrame(columns=[*REVIEW_COLUMNS, *DECISION_COLUMNS])
+        if self._annotated and self._annotated[0] == self.decisions.version and self._annotated[1] == id(df):
+            return self._annotated[2]
+        sub = df[df["confidence"].isin(REVIEW_BANDS)].copy(deep=False)
+        keys = self._keys(sub)
+        found = self.decisions.get_many(keys)
+        status, mapped, firm, prev, in_run = [], [], [], [], []
+        suggestions = sub["SECP_NAME_MAPPED"] if "SECP_NAME_MAPPED" in sub.columns else pd.Series(None, index=sub.index)
+        for key, suggested in zip(keys, suggestions):
+            d = found.get(key)
+            if d is None:
+                status.append("pending"); mapped.append(None); firm.append(None); prev.append(None); in_run.append(None)
+            elif d["decision"] == "rejected" and d.get("suggested") and norm_name(d["suggested"]) != norm_name(suggested):
+                status.append("pending"); mapped.append(None); firm.append(None)
+                prev.append(d["suggested"]); in_run.append(d.get("run_id"))
+            else:
+                status.append(d["decision"]); mapped.append(d.get("mapped_name")); firm.append(d.get("firm_id"))
+                prev.append(None); in_run.append(d.get("run_id"))
+        sub["key"], sub["decision"], sub["decided_mapped_name"] = keys.values, status, mapped
+        sub["decided_firm_id"], sub["previously_rejected"], sub["decided_in_run"] = firm, prev, in_run
+        self._annotated = (self.decisions.version, id(df), sub)
+        return sub
+
+    def _master_keys(self) -> set:
+        um = self._master_with_source()
+        if um is None or um.empty:
+            return set()
+        cached = self._cache.get("updated_master_keys")
+        if cached and cached[0] == id(um):
+            return cached[1]
+        keys = set(self._keys(um))
+        self._cache["updated_master_keys"] = (id(um), keys)
+        return keys
 
     def decision_counts(self) -> Dict[str, int]:
-        counts = {"approved": 0, "rejected": 0, "pending": 0, "applied": 0}
-        for d in self.decisions.values():
-            counts[d["decision"]] += 1
-            if d.get("applied"):
-                counts["applied"] += 1
-        counts["pending"] = max(0, int(len(self._review_frame())) - counts["approved"] - counts["rejected"])
-        counts["unapplied_approved"] = sum(1 for d in self.decisions.values()
-                                           if d["decision"] == "approved" and not d.get("applied"))
+        """Decision status of *this run's* review rows, plus how many approvals the master still lacks."""
+        annotated = self._annotated_review()
+        vc = annotated["decision"].value_counts() if len(annotated) else {}
+        counts = {k: int(vc.get(k, 0)) for k in ("approved", "rejected", "pending")}
+        counts["total"] = int(len(annotated))
+        master_keys = self._master_keys()
+        counts["unapplied_approved"] = sum(1 for d in self.decisions.approved() if d["key"] not in master_keys)
+        counts["store"] = self.decisions.counts()
         return counts
 
     def set_decisions(self, items: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
-        """Record approve / reject (or clear) for review rows.
+        """Record approve / reject (or clear) for review rows of this run.
 
         Each item: ``{"key", "decision": "approved"|"rejected"|None, "mapped_name"?, "firm_id"?}``.
         ``mapped_name`` overrides the pipeline's suggestion; Firm ID is then re-resolved
         from the Universe (case-insensitive bank-name lookup, as in the pipeline) unless
-        given explicitly.
+        given explicitly. Decisions are global: they apply to every later run too.
         """
         if self.status in ("queued", "running"):
             raise RuntimeError("The run is still in progress")
-        review = self._review_frame()
-        known = dict(zip(self._keys(review), review.index))
+        review = self._annotated_review()
+        known = dict(zip(review["key"], review.index))
         changed = 0
         for item in items:
             key = str(item.get("key", ""))
@@ -429,7 +469,7 @@ class PipelineRun:
                 raise KeyError(f"{key!r} is not a review-queue row of this run")
             decision = item.get("decision")
             if decision is None:
-                changed += self.decisions.pop(key, None) is not None
+                changed += self.decisions.clear(key, self.id)
                 continue
             if decision not in DECISIONS:
                 raise ValueError(f"decision must be one of {DECISIONS} or null, got {decision!r}")
@@ -446,20 +486,13 @@ class PipelineRun:
                 firm_id = self._resolve_firm_id(final_name)
                 if firm_id is None and mapped is None:
                     firm_id = _json_safe(row.get("Firm_ID"))
-            self.decisions[key] = {
-                "decision": decision, "mapped_name": mapped, "firm_id": _json_safe(firm_id),
-                "suggested": suggested, "match_method": _json_safe(row.get("match_method")),
-                "match_score": _json_safe(row.get("match_score")), "confidence": _json_safe(row.get("confidence")),
-                "at": _now(), "applied": False,
-            }
+            self.decisions.set(
+                key, decision=decision, mapped_name=mapped, firm_id=_json_safe(firm_id), suggested=suggested,
+                match_method=_json_safe(row.get("match_method")), match_score=_json_safe(row.get("match_score")),
+                confidence=_json_safe(row.get("confidence")), run_id=self.id,
+            )
             changed += 1
-        self._save_decisions()
         return {"changed": changed, "counts": self.decision_counts()}
-
-    def _save_decisions(self) -> None:
-        tmp = self._decisions_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self.decisions, indent=1, default=str))
-        tmp.replace(self._decisions_path)
 
     def _resolve_firm_id(self, mapped_name: Optional[str]) -> Any:
         """Universe lookup by (upper-cased) bank name - the pipeline's Pass 1 rule."""
@@ -494,28 +527,24 @@ class PipelineRun:
         return None
 
     def apply_decisions(self) -> Dict[str, Any]:
-        """Append every approved review row to the updated master.
+        """Append every approved review row (from any run) to this run's updated master.
 
         Writes a fresh ``updated_master_<ts>.csv`` (+ ``_with_source``) so the
         newest file always reflects the reviewer's decisions; earlier files stay
         for audit. Original master and pipeline rows still win on a key clash.
         """
-        if self.status in ("queued", "running"):
+        if self.status in ("queued", "running") and threading.current_thread() is not self._thread:
             raise RuntimeError("The run is still in progress")
         base = self._master_with_source()
         if base is None:
             raise FileNotFoundError("This run has no updated master to extend")
         base = base[~base.get("_source", pd.Series("", index=base.index)).astype(str).eq("reviewed_approved")]
-        approved = {k: d for k, d in self.decisions.items() if d["decision"] == "approved"}
-        rows = []
-        for key, d in approved.items():
-            debt, secp, name = key.split("|", 2)
-            rows.append({
-                "DEBT_STATE": debt or None, "SECP_STATE": secp or None, "SECP_NAME": name,
-                "SECP_NAME_MAPPED": d.get("mapped_name") or d.get("suggested"),
-                "Firm ID": d.get("firm_id"), "_source": "reviewed_approved",
-            })
-        new = pd.DataFrame(rows, columns=list(MASTER_COLUMNS) + ["_source"])
+        approved = self.decisions.approved()
+        new = pd.DataFrame([{
+            "DEBT_STATE": d["debt_state"], "SECP_STATE": d["secp_state"], "SECP_NAME": d["secp_name"],
+            "SECP_NAME_MAPPED": d["mapped_name"] or d["suggested"], "Firm ID": d["firm_id"],
+            "_source": "reviewed_approved",
+        } for d in approved], columns=list(MASTER_COLUMNS) + ["_source"])
         combined = pd.concat([base, new], ignore_index=True, sort=False)
         combined = combined.drop_duplicates(subset=list(MASTER_KEY), keep="first").reset_index(drop=True)
         fid = pd.to_numeric(combined["Firm ID"], errors="coerce")  # keep the master's integer formatting
@@ -532,11 +561,9 @@ class PipelineRun:
         combined[canonical].to_csv(out, index=False)
         combined.to_csv(self.output_dir / f"updated_master_{ts}_with_source.csv", index=False)
         self._cache["updated_master_data"] = combined
-        for d in approved.values():
-            d["applied"] = True
-        self._save_decisions()
+        self._cache.pop("updated_master_keys", None)
         self._log("INFO", f"Applied review decisions: {added:,} approved rows added -> {out.name} "
-                          f"({len(approved) - added:,} skipped as duplicates of existing keys)")
+                          f"({len(approved) - added:,} already present under the same key)")
         if self.summary is not None:
             src = combined["_source"].astype(str)
             self.summary["updated_master"] = {
@@ -614,7 +641,7 @@ class PipelineRun:
 
     # --------------------------------------------------------------- restore
     @classmethod
-    def load(cls, run_dir: Path) -> Optional["PipelineRun"]:
+    def load(cls, run_dir: Path, decisions: Optional[DecisionStore] = None) -> Optional["PipelineRun"]:
         meta = run_dir / "run.json"
         if not meta.is_file():
             return None
@@ -622,7 +649,7 @@ class PipelineRun:
         spec = make_datasource(data["source"]).spec
         cfg = PipelineConfig.from_overrides(data.get("config") or {})
         run = cls(spec, cfg, runs_root=run_dir.parent, sample_rows=data.get("sample_rows", 0),
-                  run_id=data["id"], name=data.get("name", ""))
+                  run_id=data["id"], name=data.get("name", ""), decisions=decisions)
         run.created_at = data.get("created_at", run.created_at)
         run.started_at, run.finished_at = data.get("started_at"), data.get("finished_at")
         run.status = data.get("status", "unknown")
@@ -635,30 +662,34 @@ class PipelineRun:
         for line in data.get("log_tail", []):
             run._logs.append(LogLine(**line))
             run._seq = max(run._seq, line["seq"])
-        if run._decisions_path.is_file():
+        legacy = run._legacy_decisions_path
+        if legacy.is_file():  # pre-SQLite per-run decisions: fold into the shared store once
             try:
-                run.decisions = json.loads(run._decisions_path.read_text())
-            except Exception:  # noqa: BLE001 - a corrupt file must not hide the run
-                run.decisions = {}
+                n = run.decisions.import_legacy(json.loads(legacy.read_text()), run.id)
+                legacy.rename(legacy.with_suffix(".json.imported"))
+                run._log("INFO", f"Imported {n} decision(s) from decisions.json into the decisions database")
+            except Exception as e:  # noqa: BLE001 - a corrupt file must not hide the run
+                run._log("WARNING", f"Could not import legacy decisions.json: {e}")
         return run
 
 
 class RunStore:
-    """All runs known to this engine, newest first."""
+    """All runs known to this engine, newest first (sharing one decision store)."""
 
-    def __init__(self, root: Optional[Path] = None):
+    def __init__(self, root: Optional[Path] = None, decisions_db: Optional[Path] = None):
         self.root = (root or app_data_dir() / "runs").expanduser()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.decisions = DecisionStore.at(decisions_db or self.root.parent / "decisions.sqlite")
         self._runs: Dict[str, PipelineRun] = {}
         self._lock = threading.Lock()
         for d in sorted(self.root.iterdir()):
             if d.is_dir():
-                run = PipelineRun.load(d)
+                run = PipelineRun.load(d, decisions=self.decisions)
                 if run is not None:
                     self._runs[run.id] = run
 
     def create(self, spec: SourceSpec, config: PipelineConfig, *, sample_rows: int = 0, name: str = "") -> PipelineRun:
-        run = PipelineRun(spec, config, runs_root=self.root, sample_rows=sample_rows, name=name)
+        run = PipelineRun(spec, config, runs_root=self.root, sample_rows=sample_rows, name=name, decisions=self.decisions)
         with self._lock:
             self._runs[run.id] = run
         return run
